@@ -1,51 +1,47 @@
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk")
 const axios = require("axios")
 const cheerio = require("cheerio")
-const fs = require("fs")
 const path = require("path")
+const fs = require("fs")
 
 /* ================= MANIFEST ================= */
 
-function loadIconDataUri() {
-  try {
-    const p = path.join(__dirname, "icon.png")
-    const b64 = fs.readFileSync(p).toString("base64")
-    return `data:image/png;base64,${b64}`
-  } catch (e) {
-    // keď icon.png chýba, addon stále funguje
-    return undefined
-  }
-}
+const BASE_URL = process.env.PUBLIC_URL || "" // na Render si to nechaj prázdne, Stremio použije URL z manifestu
 
 const manifest = {
   id: "community.prehrajto",
   version: "2.4.2",
   name: "Prehraj.to (CZ/SK)",
-  description: "Filmy a seriály z prehraj.to – CZ/SK, dabing, titulky (auto párovanie cez Cinemeta)",
-  icon: loadIconDataUri(),
+  description: "Filmy a seriály z prehrajto.cz – CZ/SK, dabing, titulky",
   resources: ["stream"],
   types: ["movie", "series"],
-  catalogs: []
+  catalogs: [],
+  // ⚠️ Stremio logo vie byť URL. Ak máš repo private, RAW z GitHubu nepôjde.
+  // Keď bude repo public, môžeš sem dať raw link na icon.png.
+  // logo: "https://raw.githubusercontent.com/<user>/<repo>/main/icon.png",
 }
 
 const builder = new addonBuilder(manifest)
 
-/* ================= HTTP CLIENT ================= */
-
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+/* ================= AXIOS (anti-bot friendly) ================= */
 
 const http = axios.create({
   timeout: 20000,
-  headers: { "User-Agent": UA }
+  headers: {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept-Language": "sk-SK,sk;q=0.9,cs-CZ;q=0.8,cs;q=0.7,en;q=0.5",
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    Connection: "keep-alive",
+  },
 })
 
 /* ================= CACHE ================= */
 
-const CACHE_TTL = 30 * 60 * 1000 // 30 min
-const cacheSearch = new Map() // query -> results
-const cachePageHtml = new Map() // pageUrl -> html
-const cacheStream = new Map() // pageUrl -> videoUrl
+const CACHE_TTL = 30 * 60 * 1000
+const cacheSearch = new Map()
+const cacheStream = new Map()
+const cacheMeta = new Map()
 
 function getCache(map, key) {
   const item = map.get(key)
@@ -64,166 +60,150 @@ function setCache(map, key, data) {
 /* ================= UTILS ================= */
 
 function normalize(str) {
-  return String(str || "")
+  return (str || "")
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "")
+    .replace(/[^a-z0-9]/g, "")
 }
 
 function pad2(n) {
   return String(n).padStart(2, "0")
 }
 
-function parseSizeToBytes(text) {
-  // napr. "7.26 GB", "850 MB"
-  const t = String(text || "").replace(",", ".").trim().toUpperCase()
-  const m = t.match(/(\d+(?:\.\d+)?)\s*(KB|MB|GB|TB)/)
-  if (!m) return null
-  const val = parseFloat(m[1])
-  const unit = m[2]
-  const mul =
-    unit === "KB" ? 1024 :
-    unit === "MB" ? 1024 ** 2 :
-    unit === "GB" ? 1024 ** 3 :
-    unit === "TB" ? 1024 ** 4 : 1
-  return Math.round(val * mul)
+function parseStremioId(type, id) {
+  // movie: tt0499549
+  // series episode: tt4574334:1:1  (imdb:season:episode)
+  if (type !== "series") return { imdb: id, season: null, episode: null, fullId: id }
+  const parts = String(id).split(":")
+  const imdb = parts[0]
+  const season = parts[1] ? pad2(parts[1]) : null
+  const episode = parts[2] ? pad2(parts[2]) : null
+  return { imdb, season, episode, fullId: id }
 }
 
-function parseDurationFromText(text) {
-  // veľmi jednoduché: hľadá "2h 58m" alebo "2h58m" alebo "01:11:28"
-  const t = String(text || "").trim()
-
-  const hms = t.match(/(\d{1,2}):(\d{2}):(\d{2})/)
-  if (hms) return `${hms[1]}:${hms[2]}:${hms[3]}`
-
-  const hm = t.match(/(\d+)\s*h\s*(\d+)\s*m/i) || t.match(/(\d+)h(\d+)m/i)
-  if (hm) return `${hm[1]}h ${hm[2]}m`
-
-  return null
-}
-
-function detectQuality(title) {
-  const t = title.toLowerCase()
-  if (t.includes("2160") || t.includes("4k") || t.includes("uhd")) return { label: "4K", rank: 4 }
-  if (t.includes("1080") || t.includes("fullhd") || t.includes("fhd")) return { label: "FULLHD", rank: 3 }
-  if (t.includes("720") || t.includes("hd")) return { label: "HD", rank: 2 }
-  return { label: "SD", rank: 1 }
-}
-
-function detectSource(title) {
-  const t = title.toLowerCase()
-  if (t.includes("bluray") || t.includes("bdrip") || t.includes("bdremux")) return "BluRay"
-  if (t.includes("web-dl") || t.includes("webdl")) return "WEB-DL"
-  if (t.includes("webrip")) return "WEBRip"
-  if (t.includes("hdtv")) return "HDTV"
-  if (t.includes("dvdrip")) return "DVDRip"
-  return ""
-}
-
-function detectHDR(title) {
-  const t = title.toLowerCase()
-  if (t.includes("hdr") || t.includes("dolby vision") || t.includes("dv")) return true
-  return false
-}
-
-function detectLang(title) {
-  const t = title.toLowerCase()
-  // preferujeme CZ/SK info
-  const czDab = /cz.*dab|dab.*cz|czdabing|cz dabing/.test(t)
-  const skDab = /sk.*dab|dab.*sk|skdabing|sk dabing/.test(t)
-  const czSub = /cz.*tit|cz.*sub|titulky|cz titulky|cz sub/.test(t)
-
-  if (czDab) return "CZ"
-  if (skDab) return "SK"
-  if (czSub) return "CZ-Sub"
-  // fallback: občas sú tam značky "cz" alebo "sk"
-  if (/\bcz\b/.test(t)) return "CZ"
-  if (/\bsk\b/.test(t)) return "SK"
-  return ""
-}
-
-function isEpisodeMatch(title, s, e) {
-  const t = title.toLowerCase()
-  const s2 = String(s).padStart(2, "0")
-  const e2 = String(e).padStart(2, "0")
-  return (
-    t.includes(`s${s2}e${e2}`) ||
-    t.includes(`${parseInt(s2, 10)}x${e2}`) ||
-    t.includes(`${parseInt(s2, 10)}x${parseInt(e2, 10)}`)
-  )
-}
-
-function buildQueries(name, year, s, e) {
+function buildQueries(name, year, season, episode) {
   const q = []
-  if (s && e) {
-    q.push(`${name} S${s}E${e}`)
-    q.push(`${name} ${parseInt(s, 10)}x${parseInt(e, 10)}`)
+  if (season && episode) {
+    q.push(`${name} S${season}E${episode}`)
+    q.push(`${name} ${season}x${episode}`)
+    q.push(`${name} s${season}e${episode}`)
+    q.push(`${name} ${season}e${episode}`)
   }
   if (year) q.push(`${name} ${year}`)
   q.push(name)
   return [...new Set(q.filter(Boolean))]
 }
 
-/* ================= ICONS & "HELLSPY FEELING" ================= */
-
-function langIcon(lang) {
-  if (lang === "CZ") return "cz"
-  if (lang === "SK") return "sk"
-  if (lang === "CZ-Sub") return "cz 💬"
-  return ""
+function isEpisodeMatch(title, season, episode) {
+  if (!season || !episode) return true
+  const t = (title || "").toLowerCase()
+  return (
+    t.includes(`s${season}e${episode}`) ||
+    t.includes(`${parseInt(season, 10)}x${parseInt(episode, 10)}`) ||
+    t.includes(`${season}x${episode}`)
+  )
 }
 
-function titleToIcons(rawTitle) {
-  const q = detectQuality(rawTitle)
-  const src = detectSource(rawTitle)
-  const hdr = detectHDR(rawTitle)
-  const lang = detectLang(rawTitle)
+/* ================= PARSE QUALITY / SIZE / TIME ================= */
 
-  const icons = []
-  // jazyk hore (ako hellspy vibe)
-  if (lang) icons.push(langIcon(lang))
-
-  // kvalita
-  if (q.label === "4K") icons.push("🌍")
-  else if (q.label === "FULLHD") icons.push("🖥️")
-  else if (q.label === "HD") icons.push("📺")
-  else icons.push("📼")
-
-  // HDR / zdroj
-  if (hdr) icons.push("🌈")
-  if (src) {
-    if (src === "BluRay") icons.push("💿")
-    else if (src === "WEB-DL") icons.push("🌐")
-    else if (src === "WEBRip") icons.push("📡")
-    else icons.push("🎞️")
-  }
-
-  return { icons: icons.join(" "), quality: q, src, hdr, lang }
+function parseQuality(title) {
+  const t = (title || "").toLowerCase()
+  if (t.includes("2160") || t.includes("4k") || t.includes("uhd")) return "4K"
+  if (t.includes("1080")) return "FULLHD"
+  if (t.includes("720")) return "HD"
+  return "SD"
 }
 
-function computeScore(rawTitle) {
-  const t = rawTitle.toLowerCase()
+function parseSourceFlags(title) {
+  const t = (title || "").toLowerCase()
+  const flags = []
+  if (t.includes("hdr")) flags.push("HDR")
+  if (t.includes("bluray") || t.includes("bdrip") || t.includes("bdremux")) flags.push("BluRay")
+  if (t.includes("web-dl") || t.includes("webdl")) flags.push("WEB-DL")
+  if (t.includes("webrip")) flags.push("WEBRip")
+  return flags
+}
+
+function parseLangFlags(title) {
+  const t = (title || "").toLowerCase()
+  const flags = []
+  if (/cz.*dab|dab.*cz|czdabing/.test(t)) flags.push("CZ")
+  if (/sk.*dab|dab.*sk/.test(t)) flags.push("SK")
+  if (/titulky|subs|sub|cz.*tit|cz.*sub/.test(t)) flags.push("SUB")
+  return flags
+}
+
+function streamIcons(title) {
+  const t = (title || "").toLowerCase()
+  let icons = "🔗"
+
+  const langs = parseLangFlags(t)
+  if (langs.includes("CZ")) icons += " 🇨🇿"
+  if (langs.includes("SK")) icons += " 🇸🇰"
+  if (langs.includes("SUB")) icons += " 💬"
+
+  const q = parseQuality(t)
+  if (q === "4K") icons += " 🚀"
+  else if (q === "FULLHD") icons += " 🎬"
+  else if (q === "HD") icons += " 📺"
+  else icons += " 📼"
+
+  const src = parseSourceFlags(t)
+  if (src.includes("HDR")) icons += " 🌈"
+  if (src.includes("BluRay")) icons += " 💿"
+  if (src.includes("WEB-DL")) icons += " 🌐"
+  if (src.includes("WEBRip")) icons += " 📡"
+
+  return icons
+}
+
+/* ================= SCORE / SORT ================= */
+
+function qualityRank(q) {
+  if (q === "4K") return 4
+  if (q === "FULLHD") return 3
+  if (q === "HD") return 2
+  return 1
+}
+
+function computeScore(title, sizeBytes) {
+  const t = (title || "").toLowerCase()
   let score = 0
 
   // jazyk
   if (/cz.*dab|dab.*cz|czdabing/.test(t)) score += 1200
-  else if (/sk.*dab|dab.*sk|skdabing/.test(t)) score += 1100
+  else if (/sk.*dab|dab.*sk/.test(t)) score += 1000
   else if (/titulky|cz.*tit|cz.*sub/.test(t)) score += 600
 
   // kvalita
-  if (t.includes("2160") || t.includes("4k") || t.includes("uhd")) score += 900
-  else if (t.includes("1080") || t.includes("fullhd") || t.includes("fhd")) score += 700
-  else if (t.includes("720") || t.includes("hd")) score += 500
-  else score += 200
+  const q = parseQuality(t)
+  score += qualityRank(q) * 1000
 
-  // HDR & zdroj
-  if (t.includes("hdr") || t.includes("dolby vision") || t.includes("dv")) score += 400
-  if (t.includes("bluray") || t.includes("bdrip") || t.includes("bdremux")) score += 350
-  else if (t.includes("web-dl") || t.includes("webdl")) score += 250
-  else if (t.includes("webrip")) score += 200
+  // zdroj
+  if (t.includes("hdr")) score += 700
+  if (t.includes("bluray") || t.includes("bdrip") || t.includes("bdremux")) score += 550
+  else if (t.includes("web-dl") || t.includes("webdl")) score += 450
+  else if (t.includes("webrip")) score += 350
+
+  // veľkosť len jemne (aby 4K menšie neprepadlo pod 1080)
+  if (typeof sizeBytes === "number") score += Math.min(400, Math.floor(sizeBytes / (1024 * 1024 * 1024)) * 25)
 
   return score
+}
+
+function parseSizeToBytes(text) {
+  // napr: "7.26 GB" / "850 MB"
+  if (!text) return null
+  const m = String(text).trim().match(/([\d.,]+)\s*(GB|MB|TB)/i)
+  if (!m) return null
+  const num = parseFloat(m[1].replace(",", "."))
+  const unit = m[2].toUpperCase()
+  if (Number.isNaN(num)) return null
+  if (unit === "MB") return num * 1024 * 1024
+  if (unit === "GB") return num * 1024 * 1024 * 1024
+  if (unit === "TB") return num * 1024 * 1024 * 1024 * 1024
+  return null
 }
 
 /* ================= SCRAPING ================= */
@@ -242,29 +222,33 @@ async function searchPrehrajto(query) {
     const href = $(el).attr("href")
     const title = $(el).find(".video__title").text().trim()
 
+    // tagy (prehrajto má často viac tagov – size/time/quality...)
+    const tags = []
+    $(el)
+      .find(".video__tag")
+      .each((__, tagEl) => {
+        const t = $(tagEl).text().trim()
+        if (t) tags.push(t)
+      })
+
     if (!href || !title) return
     if (title.toLowerCase().includes("trailer")) return
 
-    // metadáta (size, time) sú v tagoch – skúsime vytiahnuť konkrétne
-    const sizeText = $(el).find(".video__tag--size").text().trim() || ""
-    const timeText = $(el).find(".video__tag--time").text().trim() || ""
-
-    // fallback: všetky tagy dokopy
-    const metaAll = $(el).find(".video__tag").text().trim() || ""
-
-    const page = "https://prehrajto.cz" + href
-    const sizeBytes = parseSizeToBytes(sizeText || metaAll)
-    const duration = parseDurationFromText(timeText || metaAll)
+    // pokus o size/time z tagov
+    const tagText = tags.join(" · ")
+    const sizeMatch = tags.find((x) => /(\d+[.,]?\d*)\s*(GB|MB|TB)/i.test(x)) || ""
+    const timeMatch =
+      tags.find((x) => /(\d+h)?\s*\d+m/i.test(x)) || tags.find((x) => /:\d\d:\d\d/.test(x)) || ""
 
     results.push({
-      page,
+      page: "https://prehrajto.cz" + href,
       rawTitle: title,
       normTitle: normalize(title),
-      sizeText: sizeText || "",
-      timeText: timeText || "",
-      metaAll,
-      sizeBytes,
-      duration
+      tags,
+      tagText,
+      sizeText: sizeMatch,
+      timeText: timeMatch,
+      sizeBytes: parseSizeToBytes(sizeMatch),
     })
   })
 
@@ -272,82 +256,63 @@ async function searchPrehrajto(query) {
   return results
 }
 
-async function getPageHtml(pageUrl) {
-  const cached = getCache(cachePageHtml, pageUrl)
-  if (cached) return cached
-
-  const { data } = await http.get(pageUrl)
-  setCache(cachePageHtml, pageUrl, data)
-  return data
-}
-
 async function extractStream(pageUrl) {
   const cached = getCache(cacheStream, pageUrl)
   if (cached) return cached
 
-  const html = await getPageHtml(pageUrl)
+  const { data } = await http.get(pageUrl)
 
-  // najčastejšie: file: "https:...."
-  let m = html.match(/file:\s*"(https:[^"]+)"/)
-  if (!m) {
-    // fallback niekedy býva src: "https..."
-    m = html.match(/src:\s*"(https:[^"]+)"/)
-  }
-
+  // najčastejšie: file: "https://....mp4"
+  const m = data.match(/file:\s*"(https:[^"]+)"/)
   const video = m ? m[1] : null
+
   if (video) setCache(cacheStream, pageUrl, video)
   return video
 }
 
-/* ================= META (CINEMETA) ================= */
+/* ================= CINEMETA META ================= */
 
-async function fetchCinemeta(type, id) {
-  // Dôležité: pre series epizódu typu ttXXXX:1:1 je meta na base ttXXXX
-  const isEpisodeId = type === "series" && String(id).includes(":")
-  const baseId = isEpisodeId ? String(id).split(":")[0] : id
+async function getCinemetaMeta(type, imdb, fullId) {
+  const key = `${type}:${imdb}:${fullId || ""}`
+  const cached = getCache(cacheMeta, key)
+  if (cached) return cached
 
-  const url = `https://v3-cinemeta.strem.io/meta/${type}/${baseId}.json`
-  const res = await http.get(url)
-  return { meta: res.data && res.data.meta ? res.data.meta : null, baseId, isEpisodeId }
+  // IMPORTANT: pri series epizóde musíme ťahať meta seriálu cez imdb bez :S:E
+  const metaUrl = `https://v3-cinemeta.strem.io/meta/${type}/${imdb}.json`
+  const res = await axios.get(metaUrl, { timeout: 15000 })
+  const meta = res.data && res.data.meta ? res.data.meta : null
+
+  setCache(cacheMeta, key, meta)
+  return meta
 }
 
 /* ================= STREAM HANDLER ================= */
 
 builder.defineStreamHandler(async ({ type, id }) => {
   try {
-    console.log("STREAM REQ:", { type, id })
+    const { imdb, season, episode, fullId } = parseStremioId(type, id)
 
-    const { meta, isEpisodeId } = await fetchCinemeta(type, id)
+    console.log("STREAM REQ:", { type, id, imdb, season, episode })
+
+    const meta = await getCinemetaMeta(type, imdb, fullId)
     if (!meta) return { streams: [] }
 
     const name = meta.name
     const year = meta.year
 
-    let s = ""
-    let e = ""
+    // pri seriáloch skúsime nájsť epizódu v meta.videos podľa fullId
+    let s = season
+    let e = episode
 
-    if (type === "series") {
-      // pokus 1: z id tt..:S:E
-      if (String(id).includes(":")) {
-        const parts = String(id).split(":")
-        if (parts.length >= 3) {
-          s = pad2(parts[1])
-          e = pad2(parts[2])
-        }
-      }
-
-      // pokus 2: ak by sedelo video id v meta.videos (niekedy pomôže)
-      if ((!s || !e) && Array.isArray(meta.videos)) {
-        const ep = meta.videos.find(v => v && v.id === id)
-        if (ep) {
-          s = pad2(ep.season)
-          e = pad2(ep.episode)
-        }
+    if (type === "series" && Array.isArray(meta.videos)) {
+      const ep = meta.videos.find((v) => v.id === fullId)
+      if (ep) {
+        s = pad2(ep.season)
+        e = pad2(ep.episode)
       }
     }
 
     const queries = buildQueries(name, year, s, e)
-
     const streams = []
     const seen = new Set()
 
@@ -359,88 +324,75 @@ builder.defineStreamHandler(async ({ type, id }) => {
       for (const r of results) {
         if (seen.has(r.page)) continue
 
-        // základné párovanie názvu (aby nebral hovadiny)
-        // (pri seriáloch necháme trochu voľnejšie, lebo názvy epizód bývajú divné)
-        const okName = r.normTitle.includes(normName) || normName.includes(r.normTitle)
-        if (type === "movie" && !okName) continue
+        // jemnejšie párovanie názvu (pri seriáloch môžu byť rôzne varianty)
+        const okName =
+          r.normTitle.includes(normName) ||
+          normName.includes(r.normTitle) ||
+          r.normTitle.includes(normalize(name.split(" ")[0]))
 
-        // seriál: musí sedieť epizóda, ak máme S/E
-        if (type === "series") {
-          if (s && e) {
-            if (!isEpisodeMatch(r.rawTitle, s, e)) continue
-          } else {
-            // ak nemáme s/e, radšej nevracaj nič (aby to nebolo random)
-            continue
-          }
-        }
+        if (!okName) continue
+        if (type === "series" && !isEpisodeMatch(r.rawTitle, s, e)) continue
 
         const video = await extractStream(r.page)
         if (!video) continue
 
         seen.add(r.page)
 
-        const { icons, quality, src, hdr, lang } = titleToIcons(r.rawTitle)
+        const quality = parseQuality(r.rawTitle)
+        const srcFlags = parseSourceFlags(r.rawTitle).join(" ")
+        const sizeLine = r.sizeText ? `💾 ${r.sizeText}` : ""
+        const timeLine = r.timeText ? `⏱️ ${r.timeText}` : ""
 
-        // “Hellspy feeling”: ľavý stĺpec je `name`, vpravo multiline `title`
-        // 1. riadok: jazyk + ikonky + názov
-        // 2. riadok: kvalita + zdroj + HDR
-        // 3. riadok: veľkosť + čas (ak je)
-        const row1 = `${icons}  ${r.rawTitle}`
-        const row2Parts = []
-        if (quality?.label) row2Parts.push(quality.label)
-        if (src) row2Parts.push(src)
-        if (hdr) row2Parts.push("HDR")
-        const row2 = row2Parts.length ? row2Parts.join("  ") : ""
-
-        const row3Parts = []
-        if (r.sizeText) row3Parts.push(`💾 ${r.sizeText}`)
-        if (r.duration) row3Parts.push(`⏱ ${r.duration}`)
-        const row3 = row3Parts.join("   ")
-
-        const prettyTitle = [row1, row2, row3].filter(Boolean).join("\n")
-
-        const score = computeScore(r.rawTitle)
+        // “Hellspy feeling” = viac riadkov v title (Stremio to často zobrazí pekne pod sebou)
+        const line1 = `▶️ Prehraj.to (CZ/SK)`
+        const line2 = `${streamIcons(r.rawTitle)} ${r.rawTitle}`
+        const line3 = [
+          `🖥️ ${quality}`,
+          srcFlags ? `| ${srcFlags}` : "",
+          sizeLine ? `| ${sizeLine}` : "",
+          timeLine ? `| ${timeLine}` : "",
+        ]
+          .filter(Boolean)
+          .join(" ")
 
         streams.push({
-          name: "Prehraj.to",
-          title: prettyTitle,
+          title: `${line1}\n${line2}\n${line3}`,
           url: video,
-          _score: score,
-          _qRank: quality.rank,
-          _size: r.sizeBytes || 0,
-          _lang: lang || ""
+          score: computeScore(r.rawTitle, r.sizeBytes),
+          _qualityRank: qualityRank(quality),
+          _sizeBytes: r.sizeBytes || 0,
         })
       }
     }
 
-    // Inteligentné triedenie:
-    // 1) kvalita (4K > 1080 > 720 > SD)
-    // 2) v rámci kvality väčšia veľkosť vyššie
-    // 3) potom score (jazyk/zdroj/HDR)
+    // inteligentné radenie:
+    // 1) score (kvalita+jazyk+HDR)
+    // 2) kvalita
+    // 3) veľkosť v rámci kvality
     streams.sort((a, b) => {
-      if (b._qRank !== a._qRank) return b._qRank - a._qRank
-      if ((b._size || 0) !== (a._size || 0)) return (b._size || 0) - (a._size || 0)
-      return (b._score || 0) - (a._score || 0)
+      if ((b.score || 0) !== (a.score || 0)) return (b.score || 0) - (a.score || 0)
+      if ((b._qualityRank || 0) !== (a._qualityRank || 0)) return (b._qualityRank || 0) - (a._qualityRank || 0)
+      return (b._sizeBytes || 0) - (a._sizeBytes || 0)
     })
 
-    // vráť len Stremio polia
-    const out = streams.map(s => ({ name: s.name, title: s.title, url: s.url }))
+    // odstránime interné polia
+    const out = streams.map(({ _qualityRank, _sizeBytes, ...x }) => x)
 
-    console.log(`✅ Streams found: ${out.length}`)
+    console.log(`✅ Found streams: ${out.length}`)
     return { streams: out }
   } catch (err) {
-    console.error("❌ Stream handler error:", err?.message || err)
+    console.log("❌ Stream handler error:", err?.message || err)
     return { streams: [] }
   }
 })
 
-/* ================= SERVER (Render + Local) ================= */
+/* ================= SERVER (Render friendly) ================= */
 
-const PORT = process.env.PORT || 7001
+const PORT = Number(process.env.PORT || 7001)
 
 serveHTTP(builder.getInterface(), {
   port: PORT,
-  address: "0.0.0.0"
+  address: "0.0.0.0",
 })
 
 console.log(`🚀 Prehraj.to addon beží na porte ${PORT}`)
