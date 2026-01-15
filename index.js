@@ -485,10 +485,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
 /* ================= ADDON SERVER (7001) ================= */
 
+const PORT = process.env.PORT || 7001
+
 serveHTTP(builder.getInterface(), {
-  port: 7001,
-  address: "127.0.0.1"
+  port: PORT,
+  address: "0.0.0.0"
 })
+
+console.log(`🚀 Prehraj.to addon beží na porte ${PORT}`)
+
 
 /* ================= ICON SERVER (7002) ================= */
 
