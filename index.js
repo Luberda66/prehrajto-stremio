@@ -26,7 +26,7 @@ const MANIFEST_LOGO_URL = process.env.MANIFEST_LOGO_URL || ""
 
 const manifest = {
   id: "community.prehrajto.czsk",
-  version: "2.4.2",
+  version: "2.5.0-local",
   name: "Prehraj.to (CZ/SK)",
   description: "Filmy a seriály z prehrajto – CZ/SK, dabing, titulky",
   resources: ["stream"],
