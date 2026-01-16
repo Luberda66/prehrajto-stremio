@@ -1,3 +1,5 @@
+"use strict"
+
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk")
 const axios = require("axios")
 const cheerio = require("cheerio")
@@ -5,57 +7,42 @@ const cheerio = require("cheerio")
 /* ================= CONFIG ================= */
 
 // Lokalny rezim (bez Renderu): Stremio sa pripaja na manifest cez 127.0.0.1
-// (Ak niekedy budes chciet online nasadenie, vtedy sa zvykne pouzit process.env.PORT + 0.0.0.0.)
 const PORT = 7001
 const ADDRESS = "127.0.0.1"
 
-const BASE_DOMAINS = [
+// Prehrajto domény (niekedy jedna funguje lepšie než druhá)
+const BASES = [
   "https://prehrajto.cz",
   "https://prehraj.to"
 ]
 
-// Stremio Cinemeta (meta pre filmy/seriály)
-const CINEMETA = "https://v3-cinemeta.strem.io"
+// TMDb (IMDB -> title/year). Ak nechceš, nechaj prázdne a pôjde to aj bez toho.
+const TMDB_KEY = process.env.TMDB_KEY || ""
 
-// TMDb fallback (ak chceš – je to voliteľné; nechávame podporu, ale nič nemusíš nastavovať)
-const TMDB_API_KEY = process.env.TMDB_API_KEY || null
+// Manifest logo (napr. raw GitHub URL na icon.png)
+const MANIFEST_LOGO_URL = process.env.MANIFEST_LOGO_URL || ""
 
 /* ================= MANIFEST ================= */
 
 const manifest = {
-  id: "community.prehrajto",
+  id: "community.prehrajto.czsk",
   version: "2.4.2",
   name: "Prehraj.to (CZ/SK)",
-  description: "Filmy a seriály z prehraj.to – CZ/SK, dabing, titulky",
+  description: "Filmy a seriály z prehrajto – CZ/SK, dabing, titulky",
   resources: ["stream"],
   types: ["movie", "series"],
-  catalogs: []
+  catalogs: [],
+  logo: MANIFEST_LOGO_URL || undefined
 }
 
 const builder = new addonBuilder(manifest)
-
-/* ================= HTTP ================= */
-
-const http = axios.create({
-  timeout: 20000,
-  headers: {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-    "Accept":
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "sk-SK,sk;q=0.9,cs-CZ;q=0.8,cs;q=0.7,en;q=0.6",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
-  },
-  maxRedirects: 5,
-  validateStatus: s => s >= 200 && s < 400
-})
 
 /* ================= CACHE ================= */
 
 const CACHE_TTL = 30 * 60 * 1000
 const cacheSearch = new Map()
 const cacheStream = new Map()
+const cacheTmdb = new Map()
 
 function getCache(map, key) {
   const item = map.get(key)
@@ -71,143 +58,196 @@ function setCache(map, key, data) {
   map.set(key, { time: Date.now(), data })
 }
 
+/* ================= HTTP ================= */
+
+const http = axios.create({
+  timeout: 25000,
+  headers: {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept":
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "sk-SK,sk;q=0.9,cs-CZ;q=0.9,cs;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1"
+  },
+  maxRedirects: 5,
+  decompress: true
+})
+
+function looksLikeBlockedHtml(html) {
+  const t = String(html || "").toLowerCase()
+  return (
+    t.includes("cloudflare") ||
+    t.includes("attention required") ||
+    t.includes("cf-challenge") ||
+    t.includes("checking your browser") ||
+    t.includes("captcha") ||
+    t.includes("access denied")
+  )
+}
+
+async function fetchFromBases(path) {
+  let lastErr = null
+
+  for (const base of BASES) {
+    const url = `${base}${path}`
+    try {
+      const res = await http.get(url, { headers: { Referer: base + "/" } })
+      const html = res.data
+
+      if (looksLikeBlockedHtml(html)) {
+        console.log(`🛑 BLOCKED HTML from ${url} (looks like protection page)`)
+        continue
+      }
+
+      return { base, url, html }
+    } catch (e) {
+      lastErr = e
+      console.log(`⚠️ fetch failed: ${url} -> ${e?.response?.status || e?.code || e?.message}`)
+    }
+  }
+
+  if (lastErr) throw lastErr
+  throw new Error("No base domain worked")
+}
+
 /* ================= UTILS ================= */
 
 function normalize(str) {
-  return (str || "")
+  return String(str || "")
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]/g, "")
 }
 
-function pad2(n) {
-  return String(n).padStart(2, "0")
+function isJunkRelease(title) {
+  const t = String(title || "").toLowerCase()
+  return (
+    t.includes("trailer") ||
+    t.includes("ukazka") ||
+    t.includes("sample") ||
+    t.includes("camrip") ||
+    t.includes("telesync")
+  )
 }
 
-function isEpisodeMatch(title, s, e) {
-  const t = (title || "").toLowerCase()
-  const s1 = String(s).replace(/^0/, "")
-  const e1 = String(e).replace(/^0/, "")
+function parseSeriesEpisodeFromId(id) {
+  const s = String(id || "")
+  const m = s.match(/^(tt\d+):(\d+):(\d+)$/)
+  if (!m) return { baseId: s, season: null, episode: null }
+  return { baseId: m[1], season: Number(m[2]), episode: Number(m[3]) }
+}
+
+function isEpisodeMatchAny(titleOrUrl, season, episode) {
+  const t = String(titleOrUrl || "").toLowerCase()
+  const s = String(season).padStart(2, "0")
+  const e = String(episode).padStart(2, "0")
   return (
     t.includes(`s${s}e${e}`) ||
-    t.includes(`s${s1}e${e1}`) ||
-    t.includes(`${s}x${e}`) ||
-    t.includes(`${s1}x${e1}`)
+    t.includes(`${Number(season)}x${String(episode).padStart(2, "0")}`) ||
+    t.includes(`${Number(season)}e${String(episode).padStart(2, "0")}`)
   )
 }
 
-function buildQueries(name, year, s, e) {
+function buildQueries(name, year, season, episode) {
   const q = []
-  if (s && e) {
-    q.push(`${name} S${s}E${e}`)
-    q.push(`${name} ${Number(s)}x${Number(e)}`)
-  }
-  if (year) q.push(`${name} ${year}`)
-  q.push(name)
-  return [...new Set(q)].filter(Boolean)
-}
+  const n = String(name || "").trim()
+  if (!n) return q
 
-function looksLikeBlockedHtml(html) {
-  const t = (html || "").toLowerCase()
-  // typické “ochranné” stránky / challenge
-  return (
-    t.includes("cloudflare") ||
-    t.includes("cf-challenge") ||
-    t.includes("attention required") ||
-    t.includes("just a moment") ||
-    t.includes("captcha") ||
-    t.includes("ddos") ||
-    t.includes("checking your browser") ||
-    t.includes("enable javascript")
-  )
-}
-
-/* ================= PARSING: SIZE / DURATION ================= */
-
-function parseSizeToBytes(text) {
-  if (!text) return null
-  const m = String(text)
-    .replace(",", ".")
-    .match(/(\d+(?:\.\d+)?)\s*(gb|g|mb|m|kb|k)/i)
-  if (!m) return null
-  const v = parseFloat(m[1])
-  const u = m[2].toLowerCase()
-  if (Number.isNaN(v)) return null
-  if (u === "gb" || u === "g") return v * 1024 * 1024 * 1024
-  if (u === "mb" || u === "m") return v * 1024 * 1024
-  if (u === "kb" || u === "k") return v * 1024
-  return null
-}
-
-function bytesToPretty(bytes) {
-  if (!bytes || bytes <= 0) return null
-  const gb = bytes / (1024 * 1024 * 1024)
-  if (gb >= 1) return `${gb.toFixed(2)} GB`
-  const mb = bytes / (1024 * 1024)
-  return `${mb.toFixed(0)} MB`
-}
-
-function parseDurationToSeconds(text) {
-  if (!text) return null
-  const s = String(text).toLowerCase()
-
-  // 2h58m
-  let m = s.match(/(\d+)\s*h\s*(\d+)\s*m/)
-  if (m) return Number(m[1]) * 3600 + Number(m[2]) * 60
-
-  // 01:43:19 or 43:19
-  m = s.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/)
-  if (m) {
-    const a = Number(m[1])
-    const b = Number(m[2])
-    const c = m[3] ? Number(m[3]) : null
-    if (c === null) return a * 60 + b
-    return a * 3600 + b * 60 + c
+  if (season && episode) {
+    const s = String(season).padStart(2, "0")
+    const e = String(episode).padStart(2, "0")
+    q.push(`${n} S${s}E${e}`)
+    q.push(`${n} ${Number(season)}x${String(episode).padStart(2, "0")}`)
   }
 
-  return null
+  if (year) q.push(`${n} ${year}`)
+  q.push(n)
+
+  return [...new Set(q)]
 }
 
-function secondsToPretty(sec) {
-  if (!sec || sec <= 0) return null
-  const h = Math.floor(sec / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m`
-  return `${m}m`
+function parseSizeToBytes(size) {
+  const s = String(size || "").trim().replace(",", ".")
+  const m = s.match(/([\d.]+)\s*(GB|MB)/i)
+  if (!m) return 0
+  const val = Number(m[1])
+  const unit = m[2].toUpperCase()
+  if (!Number.isFinite(val)) return 0
+  if (unit === "GB") return Math.round(val * 1024 * 1024 * 1024)
+  if (unit === "MB") return Math.round(val * 1024 * 1024)
+  return 0
 }
 
-/* ================= ICONS / QUALITY ================= */
-
-function detectQuality(title) {
-  const t = (title || "").toLowerCase()
-  if (t.includes("2160") || t.includes("4k") || t.includes("uhd")) return "4K"
-  if (t.includes("1080") || t.includes("fullhd") || t.includes("fhd")) return "FULLHD"
-  if (t.includes("720") || t.includes("hd")) return "HD"
-  return "SD"
+function parseDurationToSeconds(dur) {
+  const s = String(dur || "").trim()
+  if (!s) return 0
+  const parts = s.split(":").map(p => Number(p))
+  if (parts.some(n => !Number.isFinite(n))) return 0
+  if (parts.length === 3) {
+    const [h, m, sec] = parts
+    return h * 3600 + m * 60 + sec
+  }
+  if (parts.length === 2) {
+    const [m, sec] = parts
+    return m * 60 + sec
+  }
+  return 0
 }
 
-function detectFormat(title) {
-  const t = (title || "").toLowerCase()
+function detectLangInfo(title) {
+  const t = String(title || "").toLowerCase()
   const flags = []
-  if (t.includes("hdr")) flags.push("HDR")
-  if (t.includes("remux")) flags.push("REMUX")
-  if (t.includes("bluray") || t.includes("bdrip") || t.includes("bd-rip")) flags.push("BluRay")
-  if (t.includes("web-dl") || t.includes("webdl")) flags.push("WEB-DL")
-  if (t.includes("webrip")) flags.push("WEBRip")
-  return flags
+  const tags = []
+  const codes = []
+
+  const hasCZ = /\bcz\b/.test(t) || t.includes("czech") || t.includes("cesky") || t.includes("česk")
+  const hasSK = /\bsk\b/.test(t) || t.includes("slovak") || t.includes("slovensk")
+  const hasEN = /\ben\b/.test(t) || t.includes("english")
+
+  const isCzDub = /cz.*dab|dab.*cz|c[zs]\s*dabing|czdabing/.test(t)
+  const isSkDub = /sk.*dab|dab.*sk|skdabing/.test(t)
+  const hasSubs = /tit|sub|titulky/.test(t)
+
+  if (hasCZ || isCzDub) flags.push("🇨🇿")
+  if (hasSK || isSkDub) flags.push("🇸🇰")
+  if (flags.length === 0 && hasEN) flags.push("🇬🇧")
+  if (flags.length === 0) flags.push("🌍")
+
+  if (flags.includes("🇨🇿")) codes.push("CZ")
+  if (flags.includes("🇸🇰")) codes.push("SK")
+  if (flags.includes("🇬🇧")) codes.push("EN")
+
+  if (isCzDub || isSkDub || /dabing|dubbing/.test(t)) tags.push("🎙")
+  if (hasSubs) tags.push("💬")
+
+  return {
+    flags: flags.join(""),
+    tags: tags.join(""),
+    codes: codes.join(" ")
+  }
 }
 
-function detectLang(title) {
-  const t = (title || "").toLowerCase()
-  // poradie: dabing > titulky > iné
-  if (/cz.*dab|dab.*cz|czdubbing|cz dab/.test(t)) return "CZ"
-  if (/sk.*dab|dab.*sk|skdubbing|sk dab/.test(t)) return "SK"
-  if (/cz.*tit|cz.*sub|titulky|subs|subtitles/.test(t)) return "CZ SUB"
-  if (t.includes("sk")) return "SK"
-  if (t.includes("cz")) return "CZ"
-  if (t.includes("en")) return "EN"
-  return null
+function qualityFromTitle(title) {
+  const t = String(title || "").toLowerCase()
+  if (t.includes("2160") || t.includes("4k") || t.includes("uhd")) return "4K"
+  if (t.includes("1080")) return "FULLHD"
+  if (t.includes("720")) return "HD"
+  return ""
+}
+
+function detectFormatLabel(title) {
+  const t = String(title || "").toLowerCase()
+  if (t.includes("hdr")) return "HDR"
+  if (t.includes("remux")) return "REMUX"
+  if (t.includes("bluray") || t.includes("bdrip")) return "BluRay"
+  if (t.includes("web-dl") || t.includes("webdl")) return "WEB-DL"
+  if (t.includes("webrip")) return "WEBRip"
+  return ""
 }
 
 function qualityRank(q) {
@@ -217,66 +257,93 @@ function qualityRank(q) {
   return 1
 }
 
-function formatRank(flags) {
-  // HDR najvyššie, potom BluRay, WEB-DL, WEBRip
-  let s = 0
-  if (flags.includes("HDR")) s += 40
-  if (flags.includes("REMUX")) s += 35
-  if (flags.includes("BluRay")) s += 30
-  if (flags.includes("WEB-DL")) s += 20
-  if (flags.includes("WEBRip")) s += 10
-  return s
+function formatRank(f) {
+  if (f === "HDR") return 5
+  if (f === "REMUX") return 4
+  if (f === "BluRay") return 3
+  if (f === "WEB-DL") return 2
+  if (f === "WEBRip") return 1
+  return 0
 }
 
-function streamBlock({ titleLine, quality, flags, sizePretty, bitrate, durationPretty, lang }) {
-  // “Hellspy feeling” = viacriadkový popis v title
-  const iconsLeft = "▶️"
-  const langPart = lang ? `🇨🇿/🇸🇰 ${lang}` : "CZ/SK"
-  const fmt = flags.length ? flags.join(" ") : ""
-  const q = quality || ""
-  const size = sizePretty || ""
-  const br = bitrate ? `${bitrate} Mbps` : ""
-  const dur = durationPretty ? durationPretty : ""
+function formatDurationPretty(time) {
+  const t = String(time || "").trim()
+  if (!t) return "—"
+  return t
+}
 
-  // 1. riadok: zdroj + jazyk
-  const line1 = `${iconsLeft} Prehraj.to (${langPart})`
-  // 2. riadok: názov
-  const line2 = `📄 ${titleLine}`
-  // 3. riadok: kvalita + format + size
-  const line3 = `🖥️ ${q}${fmt ? `  ${fmt}` : ""}${size ? `  💾 ${size}` : ""}`
-  // 4. riadok: bitrate + duration
-  const line4 = `${br ? `⚡ ${br}` : "⚡ —"}${dur ? `  ⏱️ ${dur}` : "  ⏱️ —"}`
+function buildHellspyBlock({ displayName, year, rawTitle, size, time }) {
+  const lang = detectLangInfo(rawTitle)
+  const q = qualityFromTitle(rawTitle) || "SD"
+  const fmt = detectFormatLabel(rawTitle)
 
-  return [line1, line2, line3, line4].join("\n")
+  const sizeBytes = parseSizeToBytes(size)
+  const seconds = parseDurationToSeconds(time)
+  const mbps = sizeBytes > 0 && seconds > 0 ? (sizeBytes * 8) / seconds / 1_000_000 : 0
+  const mbpsTxt = mbps > 0 ? `${mbps.toFixed(1)} Mbps` : "—"
+
+  const line1 = `📄 ${displayName}${year ? ` (${year})` : ""}`
+  const line2 = `🎧 ${lang.flags || "🌍"}${lang.codes ? ` ${lang.codes}` : ""}${lang.tags ? ` ${lang.tags}` : ""}   🖥️ ${q}${fmt ? ` ${fmt}` : ""}   💾 ${size || "—"}`
+  const line3 = `⚡ ${mbpsTxt}   ⏱ ${formatDurationPretty(time)}`
+
+  return { block: `${line1}\n${line2}\n${line3}`, q, fmt }
+}
+
+/* ================= TMDb: IMDB -> Title/Year ================= */
+
+async function tmdbFind(imdbIdFull) {
+  if (!TMDB_KEY) return null
+
+  const imdbId = String(imdbIdFull || "").split(":")[0]
+  if (!imdbId.startsWith("tt")) return null
+
+  const cached = getCache(cacheTmdb, imdbId)
+  if (cached !== null) return cached
+
+  try {
+    const url = `https://api.themoviedb.org/3/find/${imdbId}?api_key=${TMDB_KEY}&external_source=imdb_id`
+    const { data } = await axios.get(url, { timeout: 15000 })
+
+    const movie = data?.movie_results?.[0]
+    const tv = data?.tv_results?.[0]
+
+    if (movie) {
+      const res = {
+        title: movie.title || "",
+        original: movie.original_title || "",
+        year: (movie.release_date || "").slice(0, 4) || ""
+      }
+      setCache(cacheTmdb, imdbId, res)
+      return res
+    }
+
+    if (tv) {
+      const res = {
+        title: tv.name || "",
+        original: tv.original_name || "",
+        year: (tv.first_air_date || "").slice(0, 4) || ""
+      }
+      setCache(cacheTmdb, imdbId, res)
+      return res
+    }
+  } catch (e) {
+    console.log("TMDb find error:", e?.response?.status || e?.message)
+  }
+
+  setCache(cacheTmdb, imdbId, null)
+  return null
 }
 
 /* ================= SCRAPING ================= */
-
-async function fetchFromBases(path) {
-  let lastErr = null
-  for (const base of BASE_DOMAINS) {
-    const url = base + path
-    try {
-      const res = await http.get(url)
-      if (typeof res.data === "string" && looksLikeBlockedHtml(res.data)) {
-        console.log(`🛑 BLOCKED HTML from ${url} (looks like protection page)`)
-        continue
-      }
-      return { base, url, html: res.data }
-    } catch (e) {
-      lastErr = e
-    }
-  }
-  if (lastErr) throw lastErr
-  throw new Error("No base domain worked")
-}
 
 async function searchPrehrajto(query) {
   const cached = getCache(cacheSearch, query)
   if (cached) return cached
 
   const path = `/hledej/${encodeURIComponent(query)}`
-  const { html } = await fetchFromBases(path)
+  const { url, html } = await fetchFromBases(path)
+
+  console.log(`🔎 search: ${url} (len=${String(html || "").length})`)
 
   const $ = cheerio.load(html)
   const results = []
@@ -287,17 +354,28 @@ async function searchPrehrajto(query) {
     const meta = $(el).find(".video__tag").text().trim()
 
     if (!href || !title) return
-    if (title.toLowerCase().includes("trailer")) return
+    if (isJunkRelease(title)) return
 
-    // meta môže niesť veľkosť/štítky (záleží od layoutu)
+    const parent = $(el).closest(".video")
+    const size = parent.find(".video__tag--size").first().text().trim()
+    const time = parent.find(".video__tag--time").first().text().trim()
+
     results.push({
-      pagePath: href,
+      page: href.startsWith("http")
+        ? href
+        : (href.startsWith("/")
+            ? (url.split("/hledej/")[0] + href)
+            : href),
       rawTitle: title,
       normTitle: normalize(title),
-      label: `${title}${meta ? `  ${meta}` : ""}`
+      label: `${title} ${meta}`.trim(),
+      size,
+      time,
+      sizeBytes: parseSizeToBytes(size) || 0
     })
   })
 
+  console.log(`✅ found results: ${results.length} for "${query}"`)
   setCache(cacheSearch, query, results)
   return results
 }
@@ -306,227 +384,151 @@ async function extractStream(pageUrl) {
   const cached = getCache(cacheStream, pageUrl)
   if (cached) return cached
 
-  const res = await http.get(pageUrl)
-  const html = res.data
+  const { html } = await (async () => {
+    if (pageUrl.startsWith("http")) {
+      const res = await http.get(pageUrl, { headers: { Referer: pageUrl } })
+      return { html: res.data }
+    }
+    const got = await fetchFromBases(pageUrl)
+    return { html: got.html }
+  })()
 
-  // video file URL
-  const m = html.match(/file:\s*"(https:[^"]+)"/)
+  if (looksLikeBlockedHtml(html)) {
+    console.log("🛑 BLOCKED on detail page:", pageUrl)
+    return null
+  }
+
+  const m = String(html).match(/file:\s*"(https:[^"]+)"/)
   const video = m ? m[1] : null
 
-  // skúsiť vyťahať info (size / duration) z textu stránky
-  let sizeBytes = null
-  let durationSec = null
-
-  const textAll = cheerio.load(html).text()
-
-  // veľkosť
-  sizeBytes = parseSizeToBytes(textAll)
-
-  // dĺžka (niekedy býva v texte napr. 01:43:19)
-  durationSec = parseDurationToSeconds(textAll)
-
-  const out = { video, sizeBytes, durationSec }
-
-  if (video) setCache(cacheStream, pageUrl, out)
-  return out
-}
-
-/* ================= META HELPERS ================= */
-
-async function getCinemetaMeta(type, id) {
-  const url = `${CINEMETA}/meta/${type}/${id}.json`
-  const res = await axios.get(url, { timeout: 15000 })
-  return res.data && res.data.meta ? res.data.meta : null
-}
-
-function parseStremioId(type, id) {
-  // movie: tt1234567
-  // series episode: tt1234567:season:episode
-  if (type !== "series") return { imdb: id, season: null, episode: null, baseId: id }
-  const parts = String(id).split(":")
-  const imdb = parts[0]
-  const season = parts[1] ? Number(parts[1]) : null
-  const episode = parts[2] ? Number(parts[2]) : null
-  return { imdb, season, episode, baseId: imdb }
-}
-
-/* ================= SCORING / SORT ================= */
-
-function computeScore({ title, quality, flags, sizeBytes, bitrate }) {
-  let score = 0
-  const lang = detectLang(title)
-  if (lang === "CZ") score += 1200
-  else if (lang === "SK") score += 1100
-  else if (lang === "CZ SUB") score += 900
-  else if (lang === "EN") score += 200
-
-  score += qualityRank(quality) * 1000
-  score += formatRank(flags)
-
-  // bitrate a size ako jemné “v rámci kvality”
-  if (bitrate) score += Math.min(500, Math.round(bitrate * 20))
-  if (sizeBytes) score += Math.min(400, Math.round(sizeBytes / (1024 * 1024 * 200))) // ~ +1 za 200MB
-
-  return score
-}
-
-function sortStreams(a, b) {
-  // “inteligentne”: kvalita > format > size > bitrate
-  const qa = qualityRank(a.quality)
-  const qb = qualityRank(b.quality)
-  if (qb !== qa) return qb - qa
-
-  const fa = formatRank(a.flags)
-  const fb = formatRank(b.flags)
-  if (fb !== fa) return fb - fa
-
-  const sa = a.sizeBytes || 0
-  const sb = b.sizeBytes || 0
-  if (sb !== sa) return sb - sa
-
-  const ba = a.bitrate || 0
-  const bb = b.bitrate || 0
-  return bb - ba
+  if (video) setCache(cacheStream, pageUrl, video)
+  return video
 }
 
 /* ================= STREAM HANDLER ================= */
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  const parsed = parseStremioId(type, id)
+  const parsed = parseSeriesEpisodeFromId(id)
   const effectiveId = type === "series" ? parsed.baseId : id
 
-  console.log("STREAM REQ:", {
-    type,
-    id,
-    effectiveId,
-    imdb: parsed.imdb,
-    season: parsed.season,
-    episode: parsed.episode
-  })
+  console.log("STREAM REQ:", { type, id, effectiveId, season: parsed.season, episode: parsed.episode })
 
-  let meta = null
-  try {
-    meta = await getCinemetaMeta(type === "series" ? "series" : type, effectiveId)
-  } catch (e) {
-    console.log("cinemeta error:", e?.message || e)
+  const metaUrl = `https://v3-cinemeta.strem.io/meta/${type}/${effectiveId}.json`
+  const metaRes = await axios.get(metaUrl, { timeout: 15000 })
+  const meta = metaRes.data.meta
+
+  const cinName = meta.name
+  const cinYear = meta.year
+
+  let name = cinName
+  let year = cinYear
+  let original = ""
+
+  const tmdb = await tmdbFind(id)
+  if (tmdb?.title) {
+    name = tmdb.title || name
+    year = tmdb.year || year
+    original = tmdb.original || ""
   }
 
-  if (!meta) return { streams: [] }
-
-  const name = meta.name
-  const year = meta.year
-
-  // season/episode pre series
-  let s = null
-  let e = null
-
+  let season = null, episode = null
   if (type === "series") {
-    // Stremio ep id: tt...:S:E (už máme v parsed)
-    if (parsed.season != null && parsed.episode != null) {
-      s = pad2(parsed.season)
-      e = pad2(parsed.episode)
+    if (parsed.season && parsed.episode) {
+      season = parsed.season
+      episode = parsed.episode
     } else {
-      // fallback: skúsime nájsť video v meta.videos (niekedy Stremio posiela inak)
-      const ep = (meta.videos || []).find(v => v.id === id)
+      const ep = meta.videos?.find(v => v.id === id)
       if (ep) {
-        s = pad2(ep.season)
-        e = pad2(ep.episode)
+        season = ep.season
+        episode = ep.episode
       }
     }
   }
 
-  const queries = buildQueries(name, year, s, e)
+  const queries = []
+  for (const n of [name, cinName, original].filter(Boolean)) {
+    buildQueries(n, type === "movie" ? year : "", season, episode).forEach(q => queries.push(q))
+  }
+  const uniqQueries = [...new Set(queries)]
+
+  const needles = [...new Set([name, cinName, original].filter(Boolean).map(normalize))]
 
   const streams = []
   const seen = new Set()
 
-  for (const q of queries) {
+  for (const q of uniqQueries) {
     let results = []
     try {
       results = await searchPrehrajto(q)
     } catch (e) {
-      console.log("search error:", e?.message || e)
+      console.log("search error:", e?.response?.status || e?.message)
       continue
     }
 
-    const normName = normalize(name)
-
     for (const r of results) {
-      // základné párovanie názvu
-      if (!r.normTitle.includes(normName)) continue
-      if (type === "series" && s && e && !isEpisodeMatch(r.rawTitle, s, e)) continue
+      if (seen.has(r.page)) continue
+      if (isJunkRelease(r.rawTitle)) continue
 
-      // postavíme full url (zoberieme prvú base doménu ako default)
-      const pageUrl = BASE_DOMAINS[0] + r.pagePath
+      const okTitle = needles.some(n => n && r.normTitle.includes(n))
+      if (!okTitle) continue
 
-      if (seen.has(pageUrl)) continue
-      seen.add(pageUrl)
-
-      let extracted = null
-      try {
-        extracted = await extractStream(pageUrl)
-      } catch (e) {
-        continue
-      }
-      if (!extracted || !extracted.video) continue
-
-      const quality = detectQuality(r.rawTitle)
-      const flags = detectFormat(r.rawTitle)
-      const lang = detectLang(r.rawTitle)
-
-      const sizePretty = bytesToPretty(extracted.sizeBytes)
-      const durationPretty = secondsToPretty(extracted.durationSec)
-
-      // bitrate odhad: size / duration
-      let bitrate = null
-      if (extracted.sizeBytes && extracted.durationSec) {
-        const bits = extracted.sizeBytes * 8
-        bitrate = +(bits / extracted.durationSec / 1_000_000).toFixed(1)
+      if (type === "series" && season && episode) {
+        const okEp =
+          isEpisodeMatchAny(r.rawTitle, season, episode) ||
+          isEpisodeMatchAny(r.page, season, episode)
+        if (!okEp) continue
       }
 
-      const score = computeScore({
-        title: r.rawTitle,
-        quality,
-        flags,
-        sizeBytes: extracted.sizeBytes,
-        bitrate
+      const video = await extractStream(r.page)
+      if (!video) continue
+
+      const key = `v:${video}`
+      if (seen.has(key)) continue
+
+      seen.add(r.page)
+      seen.add(key)
+
+      const leftName = "🎬 Prehraj.to"
+      const displayName =
+        type === "series" && season && episode
+          ? `${name} S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`
+          : name
+
+      const { block, q: qLbl, fmt } = buildHellspyBlock({
+        displayName,
+        year: type === "movie" ? year : "",
+        rawTitle: r.rawTitle,
+        size: r.size,
+        time: r.time
       })
 
-      const titleLine = r.label
-
       streams.push({
-        title: streamBlock({
-          titleLine,
-          quality,
-          flags,
-          sizePretty,
-          bitrate,
-          durationPretty,
-          lang
-        }),
-        url: extracted.video,
-        _score: score,
-        quality,
-        flags,
-        sizeBytes: extracted.sizeBytes,
-        bitrate
+        name: leftName,
+        title: block,
+        url: video,
+        qRank: qualityRank(qLbl),
+        fRank: formatRank(fmt),
+        sizeBytes: r.sizeBytes || 0
       })
     }
   }
 
-  streams.sort(sortStreams)
+  // sort: kvalita > format > size
+  streams.sort((a, b) => {
+    if (b.qRank !== a.qRank) return b.qRank - a.qRank
+    if (b.fRank !== a.fRank) return b.fRank - a.fRank
+    return (b.sizeBytes || 0) - (a.sizeBytes || 0)
+  })
 
-  console.log("✅ Found streams:", streams.length)
+  console.log(`✅ Found streams: ${streams.length}`)
 
-  // Stremio nepodporuje custom score field oficiálne, takže si ho odstránime
   return {
-    streams: streams.map(({ _score, quality, flags, sizeBytes, bitrate, ...s }) => s)
+    streams: streams.map(({ qRank, fRank, sizeBytes, ...s }) => s)
   }
 })
 
 /* ================= SERVER ================= */
 
-// Lokalny server pre Stremio
 serveHTTP(builder.getInterface(), {
   port: PORT,
   address: ADDRESS
@@ -534,3 +536,4 @@ serveHTTP(builder.getInterface(), {
 
 console.log(`🚀 Prehraj.to addon beží na: http://${ADDRESS}:${PORT}`)
 console.log(`📄 Manifest: /manifest.json`)
+console.log(`➡️  Otvor v prehliadaci: http://${ADDRESS}:${PORT}/manifest.json`)
