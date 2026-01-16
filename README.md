@@ -1,159 +1,168 @@
-# Prehraj.to Stremio Addon (CZ/SK)
+Prehraj.to Stremio Addon (CZ/SK)
 
-## O projekte
+Lokálny Stremio doplnok pre vyhľadávanie a prehrávanie filmov a seriálov zo servera prehrajto.cz
+Optimalizovaný pre PC aj Android box v jednej LAN sieti.
 
-Tento projekt je **komunitný doplnok pre Stremio**, ktorý prepája Stremio s webom **https://prehrajto.cz**. Jeho úlohou je nájsť a sprostredkovať **priame video streamy** (filmy aj seriály) z Prehraj.to priamo do Stremia – bez potreby manuálneho vyhľadávania v prehliadači.
+✨ Čo tento doplnok robí
 
-Doplnok funguje ako „most“ medzi:
-- **Cinemeta / TMDb (IMDB ID)** – odkiaľ Stremio získa názov, rok, sezónu a epizódu
-- **prehrajto.cz** – kde sa reálne nachádzajú video súbory
+Tento addon umožňuje:
 
-Inšpiráciou pre vznik tohto doplnku bol:
-- pôvodný **KODI doplnok pre prehraj.to**
-- vizuálny a informačný štýl doplnku **Hellspy** (prehľadné streamy, ikony, technické info)
+🔎 Vyhľadávať filmy aj seriály z prehrajto.cz priamo v Stremiu
 
----
+🎬 Zobrazovať viacero streamov pre jeden titul
 
-## Funkcie doplnku
+🇨🇿🇸🇰 Rozlišovať CZ / SK / EN jazyk
 
-- 🎬 **Filmy** – vyhľadávanie podľa názvu a roka
-- 📺 **Seriály** – plná podpora epizód (S01E01, 1x01, párovanie podľa IMDB → TMDb)
-- 🔎 **Automatické vyhľadávanie** na prehrajto.cz
-- 🔗 **Priame video URL** (žiadne medzistránky)
-- 🇨🇿 🇸🇰 **Rozpoznanie jazyka** (CZ / SK / EN, dabing, titulky)
-- 🖥️ **Rozpoznanie kvality** (4K, FULLHD, HD, SD)
-- 🌈 **Rozpoznanie formátu** (HDR, BluRay, WEB-DL, WEBRip, REMUX)
-- 💾 **Veľkosť súboru**
-- ⚡ **Odhadovaný bitrate (Mbps)**
-- ⏱ **Dĺžka videa**
-- 🔥 **Inteligentné triedenie streamov**:
-  - najprv kvalita (4K → FULLHD → HD)
-  - potom formát (HDR / BluRay / WEB-DL)
-  - až následne veľkosť a bitrate
-- 🎨 **Hellspy-like zobrazenie** (viacriadkový blok s ikonami)
-- 🧠 **Cache** – menej requestov, rýchlejšie odpovede
+📺 Rozlišovať kvalitu (4K / FULLHD / HD)
 
----
+📦 Zobrazovať veľkosť súboru, dĺžku a bitrate
 
-## Lokálna inštalácia (vývoj / testovanie)
+🔥 Prehľadné „Hellspy-like“ rozloženie streamov
 
-> Tento repozitár je nastavený na **lokálne používanie**. Pri nasadení na cloud (Render/VPS) vie prehrajto.cz často vracať „protection page“, takže scraping potom zlyhá a streamy budú prázdne.
+📶 Funguje lokálne bez cloudu (žiadny Render, žiadny externý server)
 
-Doplnok je navrhnutý tak, aby sa dal **spúšťať lokálne** na tvojom počítači a testovať priamo v Stremiu.
+🖥️ Lokálny režim (odporúčaná verzia)
 
-### Požiadavky
-- Node.js (odporúčané LTS)
-- npm
+Addon beží lokálne na tvojom PC a Stremio k nemu pristupuje:
 
-### Inštalácia závislostí
+z PC
 
-V koreňovom priečinku projektu spusti:
+z Android boxu / Android TV
+➡️ stačí byť v rovnakej Wi-Fi alebo LAN sieti
 
-```bash
+📦 Verzia
+
+Aktuálna verzia: v2.5.0-local
+
+Typ: Local / LAN
+
+Cloud: ❌ nepoužíva sa
+
+Testované:
+
+Windows PC
+
+Android box (LAN)
+
+⚠️ Číslo verzie, ktoré zobrazuje Stremio (napr. 2.4.2), nemusí zodpovedať GitHub tagu.
+Stremio si verziu berie z manifest.version v index.js.
+
+📂 Štruktúra projektu
+prehrajto-stremio/
+├─ index.js
+├─ package.json
+├─ package-lock.json
+├─ icon.png
+├─ README.md
+├─ CHANGELOG.md
+├─ LICENSE
+└─ screenshots/
+   ├─ stremio-movie.png
+   └─ stremio-series.png
+
+⚙️ Požiadavky
+
+Node.js 18+
+
+NPM
+
+Stremio (PC / Android)
+
+🚀 Inštalácia (lokálne)
+1️⃣ Stiahni projekt
+git clone https://github.com/Luberda66/prehrajto-stremio.git
+cd prehrajto-stremio
+
+2️⃣ Nainštaluj závislosti
 npm install
-```
 
-Použité závislosti:
-- `stremio-addon-sdk` – API a server pre Stremio addon
-- `axios` – HTTP requesty
-- `cheerio` – parsovanie HTML (scraping prehrajto.cz)
-
----
-
-## Spustenie lokálneho servera
-
-Addon sa spúšťa ako lokálny HTTP server:
-
-```bash
+3️⃣ Spusti addon
 npm start
-```
-alebo:
-```bash
-node index.js
-```
 
-Po spustení sa v termináli zobrazí:
-- URL manifestu
-- debug správy (vyhľadávanie, epizódy, chyby requestov atď.)
 
-Typicky:
-```
-🚀 Prehraj.to addon beží na http://127.0.0.1:7001
-📄 Manifest: http://127.0.0.1:7001/manifest.json
-```
+V konzole uvidíš napríklad:
 
----
+🚀 Prehraj.to addon beží na http://0.0.0.0:7001
+📄 Manifest: http://0.0.0.0:7001/manifest.json
 
-## Inštalácia doplnku v Stremio (lokálne)
+➕ Inštalácia do Stremio
+PC
 
-1. Spusť addon (`npm start`)
-2. Otvor **Stremio**
-3. Choď do **Add-ons → Community Add-ons → Install via URL**
-4. Vlož:
-   ```
-   http://127.0.0.1:7001/manifest.json
-   ```
-5. Potvrď inštaláciu
+Otvor Stremio
 
-Od tejto chvíle sa budú pri filmoch a seriáloch v Stremiu zobrazovať streamy z Prehraj.to.
+Addons → Community Addons
 
----
+Klikni Add addon via URL
 
-## Autentifikácia / login na prehrajto.cz
+Zadaj:
 
-❌ **Nie je potrebný žiadny účet ani prihlásenie**.
+http://127.0.0.1:7001/manifest.json
 
-Addon funguje rovnako ako pôvodný KODI doplnok v „free“ režime:
-- nepoužíva cookies
-- nerieši premium download
-- nevyžaduje login ani API kľúč pre prehrajto.cz
+Android / Android TV
 
-Všetky streamy sú získavané z verejne dostupných stránok.
+Zisti IP adresu PC (napr. 192.168.1.100)
 
----
+V Stremiu na Android boxe:
 
-## Online testovanie (krok za krokom)
+http://192.168.1.100:7001/manifest.json
 
-1. Spusti addon lokálne (`npm start`)
-2. Over funkčnosť manifestu v prehliadači:
-   - `http://127.0.0.1:7001/manifest.json`
-3. Nainštaluj addon v Stremiu (Install via URL)
-4. Otvor film alebo epizódu seriálu
-5. V zozname streamov uvidíš **Prehraj.to (CZ/SK)** položky
-6. Vyber stream – prehrávanie začne okamžite
-7. Ak niečo nefunguje, sleduj terminál – zobrazujú sa tam debug informácie
 
----
+➡️ PC musí byť zapnuté a addon spustený
 
-## Poznámka
+📺 Zoradenie streamov (logika)
 
-Tento projekt je určený **na vzdelávacie a experimentálne účely**. Používateľ je zodpovedný za dodržiavanie platnej legislatívy vo svojej krajine.
+Streamy sú radené inteligentne, nie len podľa veľkosti:
 
----
+Kvalita
 
-## Screenshoty
+4K
 
-### Zobrazenie filmov – Hellspy-like štýl
+FULLHD
 
-Ukážka vyhľadania filmu v Stremiu s doplnkom **Prehraj.to (CZ/SK)**. Streamy sú zoradené podľa kvality a formátu, zobrazujú jazyk, veľkosť, HDR/WEB-DL a dĺžku.
+HD
 
-```markdown
-![Filmy – Prehraj.to addon](screenshots/stremio-movie.png)
-```
+Jazyk
 
-### Zobrazenie seriálov – epizódy (SxxExx)
+CZ / SK
 
-Plná podpora seriálov vrátane sezón a epizód. Doplnok automaticky páruje epizódy (IMDB → TMDb → Prehraj.to).
+EN
 
-```markdown
-![Seriály – Prehraj.to addon](screenshots/stremio-series.png)
-```
+Veľkosť súboru (v rámci rovnakej kvality)
 
----
+Bitrate (jemné doladenie)
 
-## Autor / Inšpirácia
+➡️ Výsledok je prehľadný zoznam podobný Hellspy.
 
-- pôvodný KODI doplnok pre prehraj.to
-- Hellspy (UI/UX inšpirácia)
-- Stremio Addon SDK
+📸 Screenshoty
+🎬 Film
 
+📺 Seriál
+
+🔐 Prihlásenie / účet
+
+❌ Nie je potrebné žiadne konto
+
+❌ Nie je potrebné prihlásenie na prehrajto.cz
+
+Addon používa verejne dostupné stránky
+
+⚠️ Upozornenie
+
+Tento projekt je určený výhradne na študijné a osobné účely.
+Autor nenesie zodpovednosť za spôsob použitia doplnku.
+
+📝 Changelog
+
+Pozri súbor CHANGELOG.md
+
+📜 Licencia
+
+MIT License – pozri LICENSE
+
+❤️ Poďakovanie
+
+Stremio komunite
+
+Inšpirácia: Hellspy UI
+
+Testovanie: PC + Android LAN
