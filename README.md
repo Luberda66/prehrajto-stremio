@@ -51,3 +51,109 @@ V koreňovom priečinku projektu spusti:
 
 ```bash
 npm install
+```
+
+Použité závislosti:
+- `stremio-addon-sdk` – API a server pre Stremio addon
+- `axios` – HTTP requesty
+- `cheerio` – parsovanie HTML (scraping prehrajto.cz)
+
+---
+
+## Spustenie lokálneho servera
+
+Addon sa spúšťa ako lokálny HTTP server:
+
+```bash
+npm start
+```
+alebo:
+```bash
+node index.js
+```
+
+Po spustení sa v termináli zobrazí:
+- URL manifestu
+- debug správy (vyhľadávanie, epizódy, chyby requestov atď.)
+
+Typicky:
+```
+🚀 Prehraj.to addon beží na http://127.0.0.1:7001
+📄 Manifest: http://127.0.0.1:7001/manifest.json
+```
+
+---
+
+## Inštalácia doplnku v Stremio (lokálne)
+
+1. Spusť addon (`npm start`)
+2. Otvor **Stremio**
+3. Choď do **Add-ons → Community Add-ons → Install via URL**
+4. Vlož:
+   ```
+   http://127.0.0.1:7001/manifest.json
+   ```
+5. Potvrď inštaláciu
+
+Od tejto chvíle sa budú pri filmoch a seriáloch v Stremiu zobrazovať streamy z Prehraj.to.
+
+---
+
+## Autentifikácia / login na prehrajto.cz
+
+❌ **Nie je potrebný žiadny účet ani prihlásenie**.
+
+Addon funguje rovnako ako pôvodný KODI doplnok v „free“ režime:
+- nepoužíva cookies
+- nerieši premium download
+- nevyžaduje login ani API kľúč pre prehrajto.cz
+
+Všetky streamy sú získavané z verejne dostupných stránok.
+
+---
+
+## Online testovanie (krok za krokom)
+
+1. Spusti addon lokálne (`npm start`)
+2. Over funkčnosť manifestu v prehliadači:
+   - `http://127.0.0.1:7001/manifest.json`
+3. Nainštaluj addon v Stremiu (Install via URL)
+4. Otvor film alebo epizódu seriálu
+5. V zozname streamov uvidíš **Prehraj.to (CZ/SK)** položky
+6. Vyber stream – prehrávanie začne okamžite
+7. Ak niečo nefunguje, sleduj terminál – zobrazujú sa tam debug informácie
+
+---
+
+## Poznámka
+
+Tento projekt je určený **na vzdelávacie a experimentálne účely**. Používateľ je zodpovedný za dodržiavanie platnej legislatívy vo svojej krajine.
+
+---
+
+## Screenshoty
+
+### Zobrazenie filmov – Hellspy-like štýl
+
+Ukážka vyhľadania filmu v Stremiu s doplnkom **Prehraj.to (CZ/SK)**. Streamy sú zoradené podľa kvality a formátu, zobrazujú jazyk, veľkosť, HDR/WEB-DL a dĺžku.
+
+```markdown
+![Filmy – Prehraj.to addon](screenshots/stremio-movie.png)
+```
+
+### Zobrazenie seriálov – epizódy (SxxExx)
+
+Plná podpora seriálov vrátane sezón a epizód. Doplnok automaticky páruje epizódy (IMDB → TMDb → Prehraj.to).
+
+```markdown
+![Seriály – Prehraj.to addon](screenshots/stremio-series.png)
+```
+
+---
+
+## Autor / Inšpirácia
+
+- pôvodný KODI doplnok pre prehraj.to
+- Hellspy (UI/UX inšpirácia)
+- Stremio Addon SDK
+
