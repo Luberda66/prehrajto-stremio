@@ -1,10 +1,14 @@
 {
   "name": "prehrajto-stremio-addon",
-  "version": "1.0.0",
-  "description": "Stremio addon for prehraj.to",
+  "version": "2.4.2",
+  "description": "Prehraj.to (CZ/SK) Stremio addon - local only",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "axios": "^1.13.2",
