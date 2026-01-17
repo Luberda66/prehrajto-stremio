@@ -73,7 +73,7 @@ Win + R → shell:startup
 ---
 
 ## 🔢 Verzia
-**v2.5.0-local**  
+**v2.4.0**  
 - stabilná lokálna verzia
 - PC + Android LAN
 - bez Render / cloud
