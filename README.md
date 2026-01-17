@@ -77,7 +77,7 @@ npm install
 ---
 
 ## Spustenie addonu
-
+```bash
 node index.js
 
 ```
