@@ -1,6 +1,6 @@
 {
   "name": "prehrajto-stremio-addon",
-  "version": "2.4.2",
+  "version": "2.5.0",
   "description": "Prehraj.to (CZ/SK) Stremio addon - local only",
   "main": "index.js",
   "scripts": {
