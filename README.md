@@ -71,12 +71,11 @@ Vďaka tomu je výber streamu rýchly a prehľadný.
 - Stremio Desktop
 
 ### Inštalácia
-```bash
-npm install
+```node index.js
 
 ---
 
-## Spustenie addonu
+### Spustenie addonu
 
 node index.js
 
