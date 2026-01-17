@@ -71,17 +71,18 @@ Vďaka tomu je výber streamu rýchly a prehľadný.
 - Stremio Desktop
 
 ### Inštalácia
-```node index.js
+```bash
+npm install
 
 ---
 
-### Spustenie addonu
+## Spustenie addonu
 
 node index.js
 
 ```
 
-Po spustení uvidíš v konzole napríklad:
+## Po spustení uvidíš v konzole napríklad:
 
 Prehraj.to addon beží na http://127.0.0.1:7001
 Manifest: http://127.0.0.1:7001/manifest.json
@@ -90,7 +91,7 @@ Manifest: http://127.0.0.1:7001/manifest.json
 
 ---
 
-📱 Android box / TV (LAN)
+## 📱 Android box / TV (LAN)
 
 Addon nie je cloudový, funguje cez lokálny server.
 
@@ -109,7 +110,7 @@ Add addons → Community addons → Install via URL
    http://192.168.1.10:7001/manifest.json
 
    ```
-Addon sa nainštaluje a funguje rovnako ako na PC.
+## Addon sa nainštaluje a funguje rovnako ako na PC.
 
 ---
 
