@@ -74,10 +74,9 @@ Vďaka tomu je výber streamu rýchly a prehľadný.
 ```bash
 npm install
 
----
 
 ## Spustenie addonu
-```bash
+
 node index.js
 
 ```
