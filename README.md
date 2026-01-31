@@ -73,10 +73,20 @@ Win + R → shell:startup
 ---
 
 ## 🔢 Verzia
-**v2.4.0**  
+**v2.4.2**  
 - stabilná lokálna verzia
 - PC + Android LAN
 - bez Render / cloud
+
+---
+
+## 📸 Ukážka v Stremio
+
+### 🎬 Film
+![Prehraj.to – Movie](screenshots/prehraj.to-movie.png)
+
+### 📺 Seriál
+![Prehraj.to – Series](screenshots/prehraj.to-series.png)
 
 ---
 

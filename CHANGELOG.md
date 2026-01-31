@@ -1,6 +1,16 @@
 \# Changelog
 
 
+## 2.4.2
+- Updated addon icon
+
+- Added screenshots to README
+
+- Stream sorting improvements
+
+- HDR handling improvements
+
+
 
 \## \[2.4.1] – 2026-01-15
 
