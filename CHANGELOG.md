@@ -10,7 +10,7 @@
 - HDR handling improvements
 
 
-## \[2.4.1] – 2026-01-15
+## 2.4.1 – 2026-01-15
 
 ### Added
 
@@ -36,12 +36,10 @@
 - Odstránené duplicitné streamy
 
 
-
 ---
 
 
-
-## \[2.0.0]
+## 2.0.0
 
 ### Added
 
