@@ -1,5 +1,4 @@
-\# Changelog
-
+# Changelog
 
 ## 2.4.2
 - Updated addon icon
@@ -11,32 +10,30 @@
 - HDR handling improvements
 
 
+## \[2.4.1] – 2026-01-15
 
-\## \[2.4.1] – 2026-01-15
+### Added
 
-\### Added
+- Hellspy-style stream UI (ikonky, stĺpcové rozloženie)
 
-\- Hellspy-style stream UI (ikonky, stĺpcové rozloženie)
+- Inteligentné skórovanie streamov (4K > 1080p > 720p)
 
-\- Inteligentné skórovanie streamov (4K > 1080p > 720p)
+- Rozlíšenie HDR / WEB-DL / BluRay
 
-\- Rozlíšenie HDR / WEB-DL / BluRay
+- Zobrazenie veľkosti a dĺžky streamu
 
-\- Zobrazenie veľkosti a dĺžky streamu
+- Podpora seriálov (SxxEyy) rovnako ako v KODI
 
-\- Podpora seriálov (SxxEyy) rovnako ako v KODI
-
-\- Cache pre rýchlejšie načítanie streamov
-
+- Cache pre rýchlejšie načítanie streamov
 
 
-\### Fixed
+### Fixed
 
-\- Opravené párovanie seriálov podľa Cinemeta
+- Opravené párovanie seriálov podľa Cinemeta
 
-\- Stabilnejší scraping Prehraj.to
+- Stabilnejší scraping Prehraj.to
 
-\- Odstránené duplicitné streamy
+- Odstránené duplicitné streamy
 
 
 
@@ -44,15 +41,15 @@
 
 
 
-\## \[2.0.0]
+## \[2.0.0]
 
-\### Added
+### Added
 
-\- Základná verzia Prehraj.to addon pre Stremio
+- Základná verzia Prehraj.to addon pre Stremio
 
-\- Filmy a seriály (CZ / SK / dabing)
+- Filmy a seriály (CZ / SK / dabing)
 
-\- Lokálny server na testovanie
+- Lokálny server na testovanie
 
 
 
