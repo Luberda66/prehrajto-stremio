@@ -1,29 +1,598 @@
-"use strict"
+"use strict";
 
-const http = require("http")
-const axios = require("axios")
-const cheerio = require("cheerio")
-const { addonBuilder, serveHTTP } = require("stremio-addon-sdk")
+// Load .env locally (TMDB_KEY, PORT, ...). Safe on production too (it just does nothing if .env is missing).
+try { try { require("dotenv").config(); } catch (_) {} } catch (e) { /* dotenv is optional */ }
 
-// ======================================================
+const axios = require("axios");
+const cheerio = require("cheerio");
+const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+
+// =========================
 // CONFIG
-// ======================================================
+// =========================
+const PORT = parseInt(process.env.PORT || "7001", 10);
+const ADDRESS = process.env.ADDRESS || "0.0.0.0";
 
-const ADDON_PORT = parseInt(process.env.PORT || "7001", 10)
-const TMDB_KEY =
-  process.env.TMDB_KEY || "f69f0cab027c48a502e74a6c3019c57a" // môžeš prepísať env premennou
+const TMDB_KEY = (process.env.TMDB_KEY || "").trim();
+const TMDB_BASE = "https://api.themoviedb.org/3";
 
-// Limity
-const stopAt = 60 // max streamov, čo vrátime
+const PREHRAJ_BASE = "https://prehrajto.cz";
+const PREHRAJ_SEARCH = (q) => `${PREHRAJ_BASE}/hledej/${encodeURIComponent(q)}`;
 
-// Prehraj.to base (pre istotu keď by redirectovalo)
-const PREHRAJTO_BASE = "https://prehrajto.cz"
+// prehraj.to občas vráti "promo" stránky, report, google play, stopped, atď.
+const JUNK_URL_PARTS = [
+  "play.google.com",
+  "/video-stopped",
+  "/videoReport",
+  "/video-report",
+  "nahlasit",
+  "vyzkousejte",
+  "zkousejte",
+  "stahnete-si-novou",
+  "download-app",
+];
 
-// ======================================================
-// MANIFEST
-// ======================================================
+// Tento regex chytá priame mp4 linky, ktoré sú reálne prehrateľné v Stremiu
+// (v praxi často premiumcdn / storage)
+const REGEX_STREAM_URL =
+  /https?:\/\/[a-z0-9.-]+(?:premiumcdn|storage)[a-z0-9.-]*\.(?:net|com)\/[^\s"'<>]+?\.(?:mp4|mkv|webm)(?:\?[^\s"'<>]+)?/gi;
 
-const manifest = {
+// =========================
+// LOG HELPERS
+// =========================
+function log(...args) {
+  console.log(...args);
+}
+function warn(...args) {
+  console.warn(...args);
+}
+function err(...args) {
+  console.error(...args);
+}
+
+// =========================
+// TEXT HELPERS
+// =========================
+function normalizeText(s) {
+  return (s || "")
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function safeNumber(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function formatSxxExx(season, episode) {
+  const s = String(season).padStart(2, "0");
+  const e = String(episode).padStart(2, "0");
+  return `S${s}E${e}`;
+}
+
+function matchesSeriesEpisode(title, season, episode) {
+  const t = normalizeText(title);
+  const s = String(season);
+  const e = String(episode);
+
+  // S01E01 / s1e1 / S1E01 etc.
+  const sxx = String(season).padStart(2, "0");
+  const exx = String(episode).padStart(2, "0");
+  if (t.includes(`s${sxx}e${exx}`)) return true;
+  if (t.includes(`s${s}e${e}`)) return true;
+  if (t.includes(`s${s}e${exx}`)) return true;
+  if (t.includes(`s${sxx}e${e}`)) return true;
+
+  // 1x01 / 01x01 / 1x1
+  if (t.includes(`${s}x${e}`)) return true;
+  if (t.includes(`${sxx}x${exx}`)) return true;
+  if (t.includes(`${s}x${exx}`)) return true;
+  if (t.includes(`${sxx}x${e}`)) return true;
+
+  return false;
+}
+
+// =========================
+// QUALITY HELPERS
+// =========================
+function qualityFromTitle(title) {
+  const t = normalizeText(title);
+
+  if (t.includes("2160p") || t.includes("4k")) return 2160;
+  if (t.includes("1440p") || t.includes("2k")) return 1440;
+  if (t.includes("1080p") || t.includes("fullhd")) return 1080;
+  if (t.includes("720p") || t.includes(" hd ")) return 720;
+  if (t.includes("480p")) return 480;
+  if (t.includes("360p")) return 360;
+
+  return NaN;
+}
+
+function qualityLabel(q) {
+  if (!Number.isFinite(q)) return "";
+  if (q >= 2160) return "4K";
+  if (q >= 1080) return "FullHD";
+  if (q >= 720) return "HD";
+  if (q >= 480) return "SD";
+  return `${q}p`;
+}
+
+function hasHDR(title) {
+  const t = normalizeText(title);
+  return t.includes("hdr") || t.includes("dolby vision") || t.includes("dv");
+}
+
+function detectLang(title) {
+  const t = normalizeText(title);
+  // CZ priority
+  if (t.includes("cz") || t.includes("czech") || t.includes("dabing") || t.includes("dubbing")) return "CZ";
+  if (t.includes("sk") || t.includes("slovak")) return "SK";
+  return "";
+}
+
+function parseSizeFromTitle(title) {
+  // často v tile býva "4.88 GB", "700 MB", atď.
+  const m = (title || "").match(/(\d+(?:\.\d+)?)\s*(GB|MB)/i);
+  if (!m) return { sizeText: "", sizeGB: NaN };
+  const val = parseFloat(m[1]);
+  const unit = (m[2] || "").toUpperCase();
+  if (!Number.isFinite(val)) return { sizeText: "", sizeGB: NaN };
+
+  const sizeGB = unit === "MB" ? val / 1024 : val;
+  return { sizeText: `${val} ${unit}`, sizeGB };
+}
+
+function estimateBitrateMbps(sizeGB, durationMin) {
+  if (!Number.isFinite(sizeGB) || !Number.isFinite(durationMin) || durationMin <= 0) return NaN;
+  // GB -> bits: GB * 1024^3 bytes * 8
+  const bits = sizeGB * 1024 * 1024 * 1024 * 8;
+  const seconds = durationMin * 60;
+  const bps = bits / seconds;
+  return bps / 1_000_000;
+}
+
+function isJunkStreamUrl(url) {
+  const u = (url || "").toLowerCase();
+  return JUNK_URL_PARTS.some((p) => u.includes(p));
+}
+
+function isJunkResult(item) {
+  const t = normalizeText(item.title);
+  const u = (item.url || "").toLowerCase();
+
+  // výsledky typu: app promo, report, stopped
+  if (isJunkStreamUrl(u)) return true;
+  if (t.includes("stahnete si novou") || t.includes("nahlasit") || t.includes("vyzkousejte")) return true;
+
+  return false;
+}
+
+// =========================
+// TMDB HELPERS
+// =========================
+async function tmdbFetchJson(url) {
+  if (!TMDB_KEY) return null;
+  try {
+    const res = await axios.get(url, { timeout: 15000 });
+    return res.data;
+  } catch (e) {
+    warn("TMDB fetch failed:", e.message);
+    return null;
+  }
+}
+
+async function tmdbFindByImdb(imdbId) {
+  if (!TMDB_KEY) return null;
+  const url = `${TMDB_BASE}/find/${encodeURIComponent(imdbId)}?api_key=${TMDB_KEY}&external_source=imdb_id`;
+  const data = await tmdbFetchJson(url);
+  if (!data) return null;
+
+  // môžu byť aj movie_results aj tv_results
+  const movie = data.movie_results && data.movie_results[0] ? data.movie_results[0] : null;
+  const tv = data.tv_results && data.tv_results[0] ? data.tv_results[0] : null;
+
+  return { movie, tv };
+}
+
+async function tmdbGetTvDetails(tvId, lang) {
+  if (!tvId) return null;
+  const url = `${TMDB_BASE}/tv/${tvId}?api_key=${TMDB_KEY}` + (lang ? `&language=${encodeURIComponent(lang)}` : "");
+  return tmdbFetchJson(url);
+}
+
+async function tmdbGetMovieDetails(movieId, lang) {
+  if (!movieId) return null;
+  const url = `${TMDB_BASE}/movie/${movieId}?api_key=${TMDB_KEY}` + (lang ? `&language=${encodeURIComponent(lang)}` : "");
+  return tmdbFetchJson(url);
+}
+
+function uniqTitles(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const t of arr || []) {
+    const s = (t || "").trim();
+    if (!s) continue;
+    const k = normalizeText(s);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
+}
+
+// =========================
+// PREHRAJ SEARCH + PARSE
+// =========================
+async function searchPrehraj(query) {
+  const url = PREHRAJ_SEARCH(query);
+  try {
+    const res = await axios.get(url, {
+      timeout: 20000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept-Language": "cs-CZ,sk-SK;q=0.9,en-US;q=0.8,en;q=0.7",
+      },
+    });
+
+    const $ = cheerio.load(res.data);
+    const items = [];
+
+    // karty v searchi: <a href="/nejaky-nazov/abcdef...">
+    $("a").each((_, el) => {
+      const href = $(el).attr("href");
+      if (!href) return;
+
+      // detail stránky sú typicky /slug/hash
+      if (!/^\/[^\/]+\/[a-f0-9]{8,}/i.test(href)) return;
+
+      const full = PREHRAJ_BASE + href;
+      const text = $(el).text().replace(/\s+/g, " ").trim();
+      if (!text) return;
+
+      items.push({ title: text, url: full });
+    });
+
+    // vyčisti dup
+    const seen = new Set();
+    const out = [];
+    for (const it of items) {
+      const key = it.url;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(it);
+    }
+
+    return out;
+  } catch (e) {
+    warn("searchPrehraj failed:", query, e.message);
+    return [];
+  }
+}
+
+async function parseDetailPage(detailUrl) {
+  try {
+    const res = await axios.get(detailUrl, {
+      timeout: 20000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept-Language": "cs-CZ,sk-SK;q=0.9,en-US;q=0.8,en;q=0.7",
+        Referer: PREHRAJ_BASE,
+      },
+    });
+
+    const html = res.data || "";
+    const urls = new Set();
+
+    // 1) priame mp4 z JS/HTML
+    const found = html.match(REGEX_STREAM_URL) || [];
+    for (const u of found) urls.add(u);
+
+    // 2) fallback: ak nič, aspoň player link (niekedy funguje, ale je to posledná záchrana)
+    if (urls.size === 0) {
+      urls.add(detailUrl);
+    }
+
+    return [...urls];
+  } catch (e) {
+    warn("parseDetailPage failed:", detailUrl, e.message);
+    return [];
+  }
+}
+
+// =========================
+// UI BLOCK (Variant B style)
+// =========================
+function buildUiBlock(meta, opts) {
+  const title = meta.title || "Stream";
+  const raw = (meta.rawTitle || "").toString();
+
+  const PH = "⠀"; // U+2800
+
+  const tNorm = normalizeText(raw);
+
+  // audio/sub tagy (voliteľné)
+  const hasDubbing = tNorm.includes("dabing") || tNorm.includes("dubbing");
+  const hasSubs = tNorm.includes("titulky") || tNorm.includes("subs") || tNorm.includes("subtitles") || /sub/.test(tNorm);
+
+  // zdroj tagy (voliteľné)
+  const tags = [];
+  if (tNorm.includes("remux")) tags.push("REMUX");
+  if (tNorm.includes("bluray") || tNorm.includes("blu-ray") || tNorm.includes("brrip") || tNorm.includes("bd")) tags.push("BluRay");
+  if (tNorm.includes("web-dl") || tNorm.includes("webdl")) tags.push("WEB-DL");
+  if (tNorm.includes("webrip")) tags.push("WEBRip");
+
+  // 1) názov
+  const line1 = title || PH;
+
+  // 2) jazyk + (voliteľne) 🎙️ / 💬
+  const lang = meta.lang ? `🌐 ${meta.lang}` : "";
+  const l2parts = [lang];
+  if (hasDubbing) l2parts.push("🎙️");
+  if (hasSubs) l2parts.push("💬");
+  const line2 = l2parts.filter(Boolean).join("  ") || PH;
+
+  // 3) kvalita + HDR + source tagy + veľkosť
+  const q = meta.qLabel ? `📺 ${meta.qLabel}` : "";
+  const hdr = meta.hdr ? "🌈 HDR" : "";
+  const size = meta.sizeText ? `💾 ${meta.sizeText}` : "";
+  const l3parts = [q, hdr, ...tags, size].filter(Boolean);
+  const line3 = l3parts.join("  ") || PH;
+
+  // 4) Mbps + čas
+  const bitrate = opts && Number.isFinite(opts.bitrateMbps) ? `⚡ ${opts.bitrateMbps.toFixed(1)} Mbps` : "⚡ -";
+  const dur = opts && Number.isFinite(opts.durationMin) ? `🕒 ${opts.durationMin}m` : "🕒 -";
+  const line4 = [bitrate, dur].filter(Boolean).join("  ") || PH;
+
+  return [line1, line2, line3, line4].join("\n");
+}
+
+// =========================
+// CORE: BUILD STREAMS
+// =========================
+async function getStreams(type, id) {
+  const isSeries = type === "series";
+  const imdbId = (id || "").split(":")[0];
+
+  let season = NaN;
+  let episode = NaN;
+  let episodeName = "";
+
+  if (isSeries) {
+    const parts = (id || "").split(":");
+    season = safeNumber(parts[1]);
+    episode = safeNumber(parts[2]);
+
+    try {
+      const epName = parts[3] || "";
+      episodeName = epName; log("Episode name:", epName);
+    } catch (_) {}
+  }
+
+  if (isSeries && (!Number.isFinite(season) || !Number.isFinite(episode))) {
+    return [];
+  }
+
+  // title z TMDB
+  let title = imdbId;
+  let originalTitle = "";
+  let year = "";
+  let runtimeMin = NaN;
+
+  const found = await tmdbFindByImdb(imdbId);
+  if (found) {
+    if (!isSeries && found.movie) {
+      title = found.movie.title || imdbId;
+      originalTitle = found.movie.original_title || "";
+      year = (found.movie.release_date || "").slice(0, 4);
+    }
+    if (isSeries && found.tv) {
+      title = found.tv.name || imdbId;
+      originalTitle = found.tv.original_name || "";
+      year = (found.tv.first_air_date || "").slice(0, 4);
+    }
+  }
+
+  title = title || originalTitle || imdbId;
+
+  const titleCandidates = uniqTitles([ title, originalTitle ]);
+
+  try {
+    if (TMDB_KEY && found) {
+      if (found.tv && found.tv.id) {
+        const [cs, sk, en] = await Promise.allSettled([
+          tmdbGetTvDetails(found.tv.id, "cs-CZ"),
+          tmdbGetTvDetails(found.tv.id, "sk-SK"),
+          tmdbGetTvDetails(found.tv.id, "en-US"),
+        ]);
+        for (const r of [cs, sk, en]) {
+          if (r.status === "fulfilled" && r.value) {
+            titleCandidates.push(r.value.name, r.value.original_name);
+          }
+        }
+      } else if (found.movie && found.movie.id) {
+        const [cs, sk, en] = await Promise.allSettled([
+          tmdbGetMovieDetails(found.movie.id, "cs-CZ"),
+          tmdbGetMovieDetails(found.movie.id, "sk-SK"),
+          tmdbGetMovieDetails(found.movie.id, "en-US"),
+        ]);
+        for (const r of [cs, sk, en]) {
+          if (r.status === "fulfilled" && r.value) {
+            titleCandidates.push(r.value.title, r.value.original_title);
+            if (!Number.isFinite(runtimeMin) && Number.isFinite(r.value.runtime)) runtimeMin = r.value.runtime;
+          }
+        }
+      }
+    }
+  } catch (_) {}
+
+  const titles = uniqTitles(titleCandidates);
+
+  const queries = [];
+  for (const t of titles) queries.push(t);
+
+  if (!isSeries && year) {
+    for (const t of titles) queries.push(`${t} ${year}`);
+  }
+
+  if (isSeries) {
+    const se = formatSxxExx(season, episode);
+
+    for (const t of titles) {
+      queries.push(`${t} ${se}`);
+      queries.push(`${t} s${season}e${episode}`);
+      queries.push(`${t} ${season}x${episode}`);
+      queries.push(`${t} ${String(season).padStart(2, "0")}x${String(episode).padStart(2, "0")}`);
+      if (episodeName) {
+        queries.push(`${t} ${se} ${episodeName}`);
+        queries.push(`${t} ${episodeName}`);
+      }
+    }
+  }
+
+  const qSeen = new Set();
+  const qUniq = [];
+  for (const q of queries) {
+    const k = normalizeText(q);
+    if (!k) continue;
+    if (qSeen.has(k)) continue;
+    qSeen.add(k);
+    qUniq.push(q);
+  }
+
+  const candidates = [];
+  for (const q of qUniq) {
+    const items = await searchPrehraj(q);
+    for (const it of items) {
+      if (!it || !it.url || !it.title) continue;
+      if (isJunkResult(it)) continue;
+      if (isSeries && Number.isFinite(season) && Number.isFinite(episode)) {
+        if (!matchesSeriesEpisode(it.title, season, episode)) continue;
+      }
+      candidates.push(it);
+    }
+  }
+
+  const cSeen = new Set();
+  const cUniq = [];
+  for (const c of candidates) {
+    if (cSeen.has(c.url)) continue;
+    cSeen.add(c.url);
+    cUniq.push(c);
+  }
+
+  let streams = [];
+  for (const item of cUniq) {
+    const urls = await parseDetailPage(item.url);
+    if (!urls || urls.length === 0) continue;
+
+    const lang = detectLang(item.title);
+    const q = qualityFromTitle(item.title);
+    const qLabel = qualityLabel(q);
+    const hdr = hasHDR(item.title);
+    const { sizeText, sizeGB } = parseSizeFromTitle(item.title);
+
+    const durationMin = isSeries ? 42 : (Number.isFinite(runtimeMin) ? runtimeMin : 120);
+    const bitrateMbps = estimateBitrateMbps(sizeGB, durationMin);
+
+    for (const u of urls) {
+      streams.push({
+        title: buildUiBlock(
+          { title, lang, qLabel, hdr, sizeText, rawTitle: item.title },
+          { durationMin, bitrateMbps }
+        ),
+        url: u,
+        _meta: {
+          baseTitle: title,
+          lang,
+          q,
+          qLabel,
+          hdr,
+          sizeGB,
+          sizeText,
+          durationMin,
+          bitrateMbps,
+        },
+      });
+    }
+  }
+
+  streams = streams.filter((s) => s && s.url && !isJunkStreamUrl(s.url));
+
+  const seen = new Set();
+  const uniq = [];
+  for (const s of streams) {
+    if (!s || !s.url) continue;
+    if (seen.has(s.url)) continue;
+    seen.add(s.url);
+    uniq.push(s);
+  }
+  streams = uniq;
+
+  // SORT: CZ hore, potom kvalita (4K->...), HDR, potom veľkosť, potom bitrate
+  streams.sort((a, b) => {
+    const A = a._meta || {};
+    const B = b._meta || {};
+
+    const aCz = A.lang === "CZ" ? 1 : 0;
+    const bCz = B.lang === "CZ" ? 1 : 0;
+    if (aCz !== bCz) return bCz - aCz;
+
+    const aq = Number.isFinite(A.q) ? A.q : 0;
+    const bq = Number.isFinite(B.q) ? B.q : 0;
+    if (aq !== bq) return bq - aq;
+
+    const aHdr = A.hdr ? 1 : 0;
+    const bHdr = B.hdr ? 1 : 0;
+    if (aHdr !== bHdr) return bHdr - aHdr;
+
+    const asz = Number.isFinite(A.sizeGB) ? A.sizeGB : 0;
+    const bsz = Number.isFinite(B.sizeGB) ? B.sizeGB : 0;
+    if (asz !== bsz) return bsz - asz;
+
+    const ab = Number.isFinite(A.bitrateMbps) ? A.bitrateMbps : 0;
+    const bb = Number.isFinite(B.bitrateMbps) ? B.bitrateMbps : 0;
+    if (ab !== bb) return bb - ab;
+
+    return 0;
+  });
+
+  // dodatočná deduplikácia
+  const seenKeys = new Set();
+  const uniq2 = [];
+  for (const s of streams) {
+    const m = s._meta || {};
+    const br = Number.isFinite(m.bitrateMbps) ? Math.round(m.bitrateMbps * 10) / 10 : 0;
+    const key = [
+      m.lang || "",
+      m.qLabel || "",
+      m.hdr ? "1" : "0",
+      m.sizeText || "",
+      String(m.durationMin || ""),
+      String(br),
+      (s.title || "").trim()
+    ].join("|");
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    uniq2.push(s);
+  }
+  streams = uniq2;
+
+  return streams.map((s) => ({ title: s.title, url: s.url }));
+}
+
+// =========================
+// MANIFEST (base bez logo; logo doplníme dynamicky pri /manifest.json)
+// =========================
+const manifestBase = {
   id: "community.prehrajto.czsk",
   version: "2.4.2",
   name: "Prehraj.to (CZ/SK)",
@@ -31,499 +600,110 @@ const manifest = {
   resources: ["stream"],
   types: ["movie", "series"],
   catalogs: [],
-  logo: "https://raw.githubusercontent.com/Luberda66/prehrajto-stremio/main/icon.png",
-}
+  // logo sa doplní dynamicky podľa hostu
+};
 
-// ======================================================
-// HELPERS
-// ======================================================
-
-function safeStr(v) {
-  return v == null ? "" : String(v)
-}
-
-function normalize(s) {
-  return safeStr(s)
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
-function titleMatches(candidate, wantedNames) {
-  const c = normalize(candidate)
-  if (!c) return false
-  for (const n of wantedNames) {
-    const nn = normalize(n)
-    if (!nn) continue
-    if (c.includes(nn)) return true
-  }
-  return false
-}
-
-function parseSizeToBytes(text) {
-  const t = safeStr(text).replace(",", ".").toLowerCase()
-  const m = t.match(/(\d+(?:\.\d+)?)\s*(gb|g|mb|m|kb|k|tb|t)\b/)
-  if (!m) return 0
-  const num = parseFloat(m[1])
-  const unit = m[2]
-  const map = {
-    k: 1024,
-    kb: 1024,
-    m: 1024 ** 2,
-    mb: 1024 ** 2,
-    g: 1024 ** 3,
-    gb: 1024 ** 3,
-    t: 1024 ** 4,
-    tb: 1024 ** 4,
-  }
-  return Math.round(num * (map[unit] || 0))
-}
-
-function formatBytes(bytes) {
-  const b = Number(bytes || 0)
-  if (!b) return ""
-  const gb = b / (1024 ** 3)
-  if (gb >= 1) return `${gb.toFixed(gb >= 10 ? 0 : 2)} GB`.replace(".00", "")
-  const mb = b / (1024 ** 2)
-  if (mb >= 1) return `${mb.toFixed(mb >= 10 ? 0 : 2)} MB`.replace(".00", "")
-  return `${Math.round(b / 1024)} KB`
-}
-
-function qualityFromTitle(raw) {
-  const t = String(raw || "").toLowerCase()
-
-  // 2160 / 4k
-  if (/(2160p|4k|uhd)/.test(t)) return "4K"
-
-  // 1080 -> FullHD
-  if (/(1080p|full\s*hd)/.test(t)) return "FullHD"
-
-  // 720 -> HD
-  if (/(720p|[^a-z]hd[^a-z])/.test(t)) return "HD"
-
-  // 480/576/360 -> SD
-  if (/(480p|576p|360p|sd)/.test(t)) return "SD"
-
-  return "?"
-}
-
-function isHdr(raw) {
-  const t = String(raw || "").toLowerCase()
-  return /(hdr10\+?|dolby\s*vision|dv\b|hdr\b)/.test(t)
-}
-
-function languageScore(raw) {
-  const t = String(raw || "").toLowerCase()
-
-  // CZ/SK priorita
-  if (/(cz|czech|česk|cesk|dabing|dubbing)/.test(t)) return 100
-  if (/(sk|slovak|slovensk)/.test(t)) return 80
-
-  // pôvodné/ostatné
-  return 10
-}
-
-function resScore(q) {
-  if (q === "4K") return 400
-  if (q === "FullHD") return 300
-  if (q === "HD") return 200
-  if (q === "SD") return 100
-  return 0
-}
-
-function bitrateFromSizeAndTime(sizeBytes, minutes) {
-  const b = Number(sizeBytes || 0)
-  const m = Number(minutes || 0)
-  if (!b || !m) return 0
-  const seconds = m * 60
-  const bits = b * 8
-  const bps = bits / seconds
-  const mbps = bps / 1_000_000
-  return mbps
-}
-
-function formatMbps(mbps) {
-  if (!mbps || !isFinite(mbps)) return ""
-  return `${mbps.toFixed(mbps >= 10 ? 0 : 1)} Mbps`
-}
-
-function isJunkRelease(rawTitle) {
-  const t = String(rawTitle || "").toLowerCase()
-  // promo/nesúvisiace
-  if (t.includes("nahla") && t.includes("video")) return true
-  if (t.includes("stah") && t.includes("soubor")) return true
-  if (t.includes("vyzkousejte") && t.includes("prehravac")) return true
-  if (t.includes("aplikaci") && t.includes("prehraj")) return true
-  if (t.includes("google") && t.includes("play")) return true
-  if (t.includes("video stopped")) return true
-  return false
-}
-
-function isEpisodeMatchAny(text, season, episode) {
-  const s = Number(season)
-  const e = Number(episode)
-  if (!s || !e) return false
-
-  const t = String(text || "").toLowerCase()
-
-  // S01E02 / s1e2 / S1 E2
-  const re1 = new RegExp(`s\\s*0?${s}\\s*[\\._\\-\\s]*e\\s*0?${e}(?!\\d)`, "i")
-
-  // 1x02 / 01x02
-  const re2 = new RegExp(`0?${s}\\s*[x×]\\s*0?${e}(?!\\d)`, "i")
-
-  // "season 1 episode 2"
-  const re3 = new RegExp(`season\\s*0?${s}.*episode\\s*0?${e}(?!\\d)`, "i")
-
-  // CZ/SK: slabší fallback – keď sa spomenie aj sezóna aj diel
-  const hasSeasonWord = new RegExp(
-    `(s(eason)?\\s*0?${s})|(\\b0?${s}\\b\\s*(serie|sezon|séria|sezona))`,
-    "i"
-  ).test(t)
-  const hasEpisodeWord = new RegExp(
-    `(e(pisode)?\\s*0?${e})|(d[ií]l\\s*0?${e})|(ep\\.?\\s*0?${e})`,
-    "i"
-  ).test(t)
-
-  return re1.test(t) || re2.test(t) || re3.test(t) || (hasSeasonWord && hasEpisodeWord)
-}
-
-function buildUiBlock({ displayName, year, rawTitle, size, time, video }) {
-  const q = qualityFromTitle(rawTitle)
-  const hdr = isHdr(rawTitle)
-
-  const sizeText = formatBytes(size)
-  const mbps = bitrateFromSizeAndTime(size, time)
-  const mbpsText = formatMbps(mbps)
-
-  const lang = languageScore(rawTitle) >= 100 ? "CZ" : languageScore(rawTitle) >= 80 ? "SK" : ""
-
-  const line1 = `${displayName}${year ? `(${year})` : ""} • ${q}${sizeText ? ` • ${sizeText}` : ""}`
-  const line2 = `${lang ? `🌐 ${lang}` : "🌐"}${q ? `  📺 ${q}` : ""}${hdr ? "  🌈 HDR" : ""}`
-  const line3 = `${mbpsText ? `⚡ ${mbpsText}` : ""}${time ? `  🕒 ${time}m` : ""}`.trim()
-
-  // Stremio title multi-line
-  // (URL samotný Stremio zobrazí cez stream.url)
-  return [line1, line2, line3].filter(Boolean).join("\n")
-}
-
-// ======================================================
-// HTTP FETCH (PREHRAJTO)
-// ======================================================
-
-async function httpGet(url) {
-  return axios.get(url, {
-    timeout: 25000,
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "cs-CZ,cs;q=0.9,sk-SK;q=0.8,sk;q=0.7,en;q=0.4",
-      Referer: PREHRAJTO_BASE + "/",
-    },
-    validateStatus: (s) => s >= 200 && s < 400,
-  })
-}
-
-function absUrl(u) {
-  const s = safeStr(u)
-  if (!s) return ""
-  if (s.startsWith("http")) return s
-  if (s.startsWith("/")) return PREHRAJTO_BASE + s
-  return PREHRAJTO_BASE + "/" + s
-}
-
-async function searchPrehrajto(query) {
-  const q = encodeURIComponent(query)
-  const url = `${PREHRAJTO_BASE}/hledej/${q}`
-
-  const res = await httpGet(url)
-  const $ = cheerio.load(res.data)
-
-  const out = []
-
-  // zachytávanie "kariet" s výsledkami
-  // prehraj.to to občas mení, preto berieme viac možností selektorov
-  const items = $(".video, .video-item, .box, .item, .thumb").toArray()
-
-  for (const el of items) {
-    const a = $(el).find("a").first()
-    const href = a.attr("href")
-    if (!href) continue
-
-    const title =
-      $(el).find(".title").first().text().trim() ||
-      a.attr("title") ||
-      a.text().trim() ||
-      $(el).text().trim()
-
-    if (!title) continue
-
-    // veľkosť býva v kartách
-    const sizeText =
-      $(el).find(".size").first().text().trim() ||
-      $(el).text().match(/(\d+(?:[.,]\d+)?)\s*(GB|MB|KB|TB)\b/i)?.[0] ||
-      ""
-
-    out.push({
-      rawTitle: title,
-      page: absUrl(href),
-      size: parseSizeToBytes(sizeText),
-    })
-  }
-
-  // fallback: keď selektory nič nedali, aspoň linky
-  if (out.length === 0) {
-    $("a[href^='/']").each((_, a) => {
-      const href = $(a).attr("href")
-      const t = $(a).attr("title") || $(a).text()
-      if (!href || !t) return
-      const title = safeStr(t).trim()
-      if (!title) return
-      out.push({ rawTitle: title, page: absUrl(href), size: 0 })
-    })
-  }
-
-  // jemné čistenie duplicitných stránok
-  const seen = new Set()
-  const uniq = []
-  for (const r of out) {
-    if (!r || !r.page) continue
-    if (seen.has(r.page)) continue
-    seen.add(r.page)
-    uniq.push(r)
-  }
-
-  return uniq
-}
-
-async function extractStream(pageUrl) {
-  const res = await httpGet(pageUrl)
-  const html = safeStr(res.data)
-
-  // priame m3u8/mp4 v HTML (najčastejšie)
-  let direct =
-    html.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i)?.[0] ||
-    html.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/i)?.[0] ||
-    null
-
-  // často je to v JS ako: file: "https://....mp4?...token..."
-  if (!direct) {
-    direct = html.match(/file\s*:\s*"([^"]+)"/i)?.[1] || null
-  }
-
-  if (direct) {
-    const u = String(direct)
-    // nechceme promo/redirect stránky – len priame video
-    const ok = /\.(m3u8|mp4)(\?|$)/i.test(u) || /premiumcdn\.net|pf-storage/i.test(u)
-    if (!ok) return null
-    return u
-  }
-
-  return null
-}
-
-// ======================================================
-// CINEMETA
-// ======================================================
-
-async function getCinemetaMeta(type, id) {
-  // Cinemeta meta je spoľahlivé (názov, rok, atď.)
-  const url = `https://v3-cinemeta.strem.io/meta/${type}/${id}.json`
-  const res = await axios.get(url, { timeout: 12000 })
-  return res.data && res.data.meta ? res.data.meta : null
-}
-
-function buildWantedNames(meta) {
-  const names = []
-  if (!meta) return names
-
-  if (meta.name) names.push(meta.name)
-  if (meta.originalName) names.push(meta.originalName)
-
-  // niekedy je v meta aj alternatívny názov
-  if (Array.isArray(meta.aliases)) {
-    for (const a of meta.aliases) if (a) names.push(a)
-  }
-
-  // uniq
-  const seen = new Set()
-  const out = []
-  for (const n of names) {
-    const k = normalize(n)
-    if (!k || seen.has(k)) continue
-    seen.add(k)
-    out.push(n)
-  }
-  return out
-}
-
-// ======================================================
-// STREAM HANDLER
-// ======================================================
-
-const builder = new addonBuilder(manifest)
+// =========================
+// ADDON
+// =========================
+const builder = new addonBuilder(manifestBase);
 
 builder.defineStreamHandler(async (args) => {
-  const { type, id } = args || {}
-  if (!type || !id) return { streams: [] }
-
-  const streams = []
-  const deferredEpisodeCandidates = []
-
-  // id pre seriály je tt...:season:episode
-  let imdbId = id
-  let season = null
-  let episode = null
-
-  if (type === "series" && String(id).includes(":")) {
-    const parts = String(id).split(":")
-    imdbId = parts[0]
-    season = parts[1] ? parseInt(parts[1], 10) : null
-    episode = parts[2] ? parseInt(parts[2], 10) : null
-  }
-
-  let meta = null
   try {
-    meta = await getCinemetaMeta(type === "series" ? "series" : "movie", imdbId)
+    const { type, id } = args || {};
+    log("Stream request:", type, id);
+
+    const streams = await getStreams(type, id);
+    log("Found streams:", streams.length);
+
+    return { streams };
   } catch (e) {
-    console.error("cinemeta error:", e && e.message ? e.message : e)
+    err("route error:", e);
+    return { streams: [] };
   }
+});
 
-  const cinName = meta?.name || ""
-  const year = meta?.releaseInfo ? safeStr(meta.releaseInfo).slice(0, 4) : ""
+const addonInterface = builder.getInterface();
 
-  const wantedNames = buildWantedNames(meta)
-  const baseQuery = wantedNames[0] || cinName || imdbId
+// =========================
+// RUN SERVER + ICON + DYNAMIC MANIFEST
+// =========================
+function getAddonHandler(addonInterface) {
+  if (typeof addonInterface === "function") return addonInterface;
+  if (addonInterface && typeof addonInterface.getRouter === "function") return addonInterface.getRouter();
+  if (addonInterface && typeof addonInterface.router === "function") return addonInterface.router;
+  return null;
+}
 
-  // query pre seriály doplníme o SxxEyy
-  let query = baseQuery
-  if (type === "series" && season && episode) {
-    query = `${baseQuery} S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`
-  }
+function getBaseUrlFromReq(req) {
+  const xfProto = (req.headers["x-forwarded-proto"] || "").toString().split(",")[0].trim();
+  const xfHost = (req.headers["x-forwarded-host"] || "").toString().split(",")[0].trim();
 
-  let results = []
-  try {
-    results = await searchPrehrajto(query)
-  } catch (e) {
-    console.error("search error:", e && e.message ? e.message : e)
-    return { streams: [] }
-  }
+  const host = xfHost || req.headers.host;
+  const proto = xfProto || (req.socket && req.socket.encrypted ? "https" : "http");
 
-  const seen = new Set()
+  if (!host) return `http://127.0.0.1:${PORT}`;
+  return `${proto}://${host}`;
+}
 
-  for (const r of results.slice(0, 150)) {
-    if (streams.length >= stopAt) break
-    if (!r || !r.page || !r.rawTitle) continue
+const iconPath = path.join(__dirname, "icon.png");
+const addonHandler = getAddonHandler(addonInterface);
 
-    // filtrovanie odpadu ešte pred tým, než ideme na detail
-    if (isJunkRelease(r.rawTitle)) continue
+if (addonHandler) {
+  const server = http.createServer((req, res) => {
+    try {
+      const url = (req.url || "").split("?")[0];
 
-    // pri seriáloch sa pokúsime strážiť epizódu (ale s fallbackom)
-    if (type === "series" && season && episode) {
-      const okEp =
-        isEpisodeMatchAny(r.rawTitle, season, episode) ||
-        isEpisodeMatchAny(r.page, season, episode)
-      if (!okEp) {
-        deferredEpisodeCandidates.push(r)
-        continue
+      // Dynamický manifest, aby logo vždy sedelo na tú istú adresu ako manifest
+      if (url === "/manifest.json") {
+        const base = getBaseUrlFromReq(req);
+        const manifest = { ...manifestBase, logo: `${base}/icon.png` };
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-cache",
+        });
+        res.end(JSON.stringify(manifest));
+        return;
       }
+
+      // Icon route
+      if (url === "/icon.png") {
+        fs.stat(iconPath, (stErr, st) => {
+          if (stErr || !st || !st.isFile()) {
+            res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end("icon.png not found");
+            return;
+          }
+          res.writeHead(200, {
+            "Content-Type": "image/png",
+            "Cache-Control": "public, max-age=86400",
+          });
+          fs.createReadStream(iconPath).pipe(res);
+        });
+        return;
+      }
+
+      // fall back to addon routes
+      addonHandler(req, res);
+    } catch (e) {
+      err("HTTP server error:", e);
+      res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("Internal error");
     }
+  });
 
-    // aspoň názov nech sedí
-    if (!titleMatches(r.rawTitle, wantedNames)) continue
-
-    const video = await extractStream(r.page)
-    if (!video) continue
-
-    const key = `v:${video}`
-    if (seen.has(key)) continue
-    seen.add(key)
-
-    const displayName =
-      type === "series" && season && episode
-        ? `${wantedNames[0] || cinName} S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`
-        : wantedNames[0] || cinName
-
-    // dĺžku zatiaľ nevyťahujeme z prehraj.to spoľahlivo – nech je radšej prázdna než blbosť
-    const title = buildUiBlock({
-      displayName,
-      year,
-      rawTitle: r.rawTitle,
-      size: r.size,
-      time: "",
-      video,
+  server.listen(PORT, ADDRESS, () => {
+    log(`🚀 Prehraj.to addon beží (lokálne): http://127.0.0.1:${PORT}/manifest.json`);
+    log(`🖼️  Icon: http://127.0.0.1:${PORT}/icon.png`);
+    log(`📺 LAN manifest (Android/TV v rovnakej sieti): http://192.168.0.175:${PORT}/manifest.json`);
+  });
+} else {
+  serveHTTP(addonInterface, { port: PORT, address: ADDRESS })
+    .then(() => {
+      log(`🚀 Prehraj.to addon beží (lokálne): http://127.0.0.1:${PORT}/manifest.json`);
+      log(`📺 LAN manifest (Android/TV v rovnakej sieti): http://192.168.0.175:${PORT}/manifest.json`);
     })
-
-    streams.push({ title, url: video })
-  }
-
-  // Fallback pre seriály: keď ep-check nič nepustí (iný formát názvu na prehraj.to),
-  // skús ešte pár kandidátov bez ep-checku.
-  if (type === "series" && season && episode && streams.length === 0 && deferredEpisodeCandidates.length) {
-    for (const r of deferredEpisodeCandidates.slice(0, 20)) {
-      if (streams.length >= stopAt) break
-      if (seen.has(r.page)) continue
-      if (isJunkRelease(r.rawTitle)) continue
-      if (!titleMatches(r.rawTitle, wantedNames)) continue
-
-      const video = await extractStream(r.page)
-      if (!video) continue
-
-      const key = `v:${video}`
-      if (seen.has(key)) continue
-      seen.add(r.page)
-      seen.add(key)
-
-      const displayName = `${wantedNames[0] || cinName} S${String(season).padStart(2, "0")}E${String(episode).padStart(2, "0")}`
-      const title = buildUiBlock({
-        displayName,
-        year: "",
-        rawTitle: r.rawTitle,
-        size: r.size,
-        time: "",
-        video,
-      })
-
-      streams.push({ title, url: video })
-    }
-  }
-
-  // Triedenie: CZ/SK > kvalita > veľkosť
-  streams.sort((a, b) => {
-    const at = safeStr(a.title)
-    const bt = safeStr(b.title)
-
-    const as = languageScore(at)
-    const bs = languageScore(bt)
-    if (bs !== as) return bs - as
-
-    const aq = resScore(qualityFromTitle(at))
-    const bq = resScore(qualityFromTitle(bt))
-    if (bq !== aq) return bq - aq
-
-    // veľkosť len približne: je už v titulku, takže necháme stabilné
-    return 0
-  })
-
-  return { streams }
-})
-
-const addonInterface = builder.getInterface()
-
-// ======================================================
-// START SERVER
-// ======================================================
-
-serveHTTP(addonInterface, { port: ADDON_PORT, address: "0.0.0.0" })
-
-console.log(`🚀 Prehraj.to addon beží na: http://0.0.0.0:${ADDON_PORT}`)
-console.log(`📌 Manifest: /manifest.json`)
-console.log(`🌐 HTTP addon accessible at: http://127.0.0.1:${ADDON_PORT}/manifest.json`)
-console.log(
-  `👉 Android TV použi IP tvojho PC, napr.: http://192.168.0.175:${ADDON_PORT}/manifest.json`
-)
-
-// exporty kvôli Vercel / api wrapperom (ak sa niekedy vrátiš späť)
-module.exports = { addonInterface, manifest }
+    .catch((e) => {
+      err("Failed to start server:", e);
+    });
+}
